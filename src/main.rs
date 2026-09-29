@@ -65,16 +65,18 @@ enum BjtMode {
 enum BiasConfig {
     VoltageDivider,
     CollectorFeedback,
-    FixedBias,
+    EmitterBias,
+    Bootstrap,
 }
 
 fn get_mode_and_bias(mode: &mut BjtMode, bias: &mut BiasConfig, s: &str) -> Result<(), Error> {
     match s {
         "-ce"        => *mode = BjtMode::CommonEmitter,
         "-cc"        => *mode = BjtMode::CommonCollector,
-        "-voltdiv"   => *bias = BiasConfig::VoltageDivider,
+        "-vdv"       => *bias = BiasConfig::VoltageDivider,
         "-feedback"  => *bias = BiasConfig::CollectorFeedback,
-        "-fixed"     => *bias = BiasConfig::FixedBias,
+        "-emb"       => *bias = BiasConfig::EmitterBias,
+        "-bootstrap" => *bias = BiasConfig::Bootstrap,
         _ => return Err(Error::InvalidArgs(s.to_owned()))
     }
 
@@ -84,7 +86,7 @@ fn get_mode_and_bias(mode: &mut BjtMode, bias: &mut BiasConfig, s: &str) -> Resu
 impl core::fmt::Display for BjtMode {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = match self {
-            BjtMode::CommonEmitter => "Common Emitter",
+            BjtMode::CommonEmitter   => "Common Emitter",
             BjtMode::CommonCollector => "Common Collector",
         };
         write!(f, "{s}")
@@ -94,9 +96,10 @@ impl core::fmt::Display for BjtMode {
 impl core::fmt::Display for BiasConfig {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = match self {
-            BiasConfig::VoltageDivider => "Voltage Divider",
+            BiasConfig::VoltageDivider    => "Voltage Divider",
             BiasConfig::CollectorFeedback => "Collector Feedback",
-            BiasConfig::FixedBias => "Fixed Bias",
+            BiasConfig::EmitterBias       => "Emitter Bias",
+            BiasConfig::Bootstrap         => "Bootstrap",
         };
         write!(f, "{s}")
     }
@@ -145,6 +148,50 @@ fn rcf(rcf1: f64, rcf2: f64) -> f64 {
     1.0 / (PI2 * rcf1 * rcf2)
 }
 
+#[derive(Clone, Copy)]
+struct VoltageDivider {
+    r1: f64,
+    r2: f64,
+    ibias: f64,
+}
+
+union Rbias {
+    vdv: VoltageDivider,
+    rb: f64
+}
+
+impl Rbias {
+    fn get(&self, bias: &BiasConfig) -> f64 {
+        match bias {
+            BiasConfig::VoltageDivider => unsafe {
+                let r1 = self.vdv.r1;
+                let r2 = self.vdv.r2;
+                println!("r1               : {r1:.2e}");
+                println!("r2               : {r2:.2e}");
+                rpar(r1, r2)
+            },
+            BiasConfig::Bootstrap => unsafe {
+                let ib = self.vdv.ibias;
+                let r1 = self.vdv.r1;
+                let r2 = self.vdv.r2;
+                let r3_min = 0.005 / ib;
+                let r3_max = r3_min * 2.0;
+
+                println!("r1               : {r1:.2e}");
+                println!("r2               : {r2:.2e}");
+                println!("r3               : {r3_min:.2e} - {r3_max:.2e}");
+                rpar(r1, r2)
+            },
+            BiasConfig::CollectorFeedback
+            | BiasConfig::EmitterBias => unsafe {
+                let rb = self.rb;
+                println!("rb               : {rb:.2}");
+                rb
+            }
+        }
+    }
+}
+
 fn analyze(params: &Params) {
     println!("\x1B[1;32m{}\x1B[0m - \x1B[1;32m{}\x1B[0m", params.mode, params.bias);
     println!(" ---------------");
@@ -154,56 +201,71 @@ fn analyze(params: &Params) {
     let re = params.ve / ie;
     let vb = params.ve + params.vbe;
 
-    let (vc, rc) = match params.mode {
+    let (vce, rc) = match params.mode {
         BjtMode::CommonEmitter => {
             let vrc = (params.vcc - params.ve) / 2.0;
-            let vc = params.vcc - vrc;
+            let vce = params.vcc - vrc;
             let rc = vrc / params.ic;
-            println!("expected vc      : {vc:.2}");
+            println!("expected vce     : {vce:.2}");
             println!("expected vb      : {vb:.2}");
             println!(" ---------------");
-            (vc, rc)
+            (vce, rc)
         },
         BjtMode::CommonCollector => (params.vcc, 0.0),
     };
 
     let vbias = params.vbias.unwrap_or(params.vcc);
-    let ibias = params.ibias_x * ib;
-
-    let rpi = VT * params.beta / params.ic;
-    let base_impedance = rpi + (params.beta + 1.0) * re;
 
     println!("rc               : {rc:.2}");
     println!("re               : {re:.2}");
 
     let r_bias = match params.bias {
         BiasConfig::VoltageDivider => {
+            let ibias = params.ibias_x * ib;
             let r1 = (vbias - vb) / (ibias + ib);
             let r2 = vb / ibias;
 
-            println!("r1               : {r1:.1}");
-            println!("r2               : {r2:.2}");
-            println!("bias current     : {ibias:.2e}");
+            Rbias {
+                vdv: VoltageDivider { r1, r2, ibias }
+            }
+        },
+        BiasConfig::CollectorFeedback => Rbias { rb: (vce - params.vbe) / ib },
+        BiasConfig::EmitterBias => Rbias { rb: (vbias - vb) / ib },
+        BiasConfig::Bootstrap => {
+            let ibias = params.ibias_x * ib;
+            let r1 = (vbias - vb) / (ibias + ib);
+            let r2 = vb / ibias;
 
-            rpar(r1, r2)
-        },
-        BiasConfig::CollectorFeedback => {
-            (vc - vb) / ib
-        },
-        BiasConfig::FixedBias => {
-            (vbias - vb) / (ibias + ib)
-        },
+            Rbias {
+                vdv: VoltageDivider { r1, r2, ibias: ib }
+            }
+        }
     };
 
-    // let rout = rdiv / params.beta;
+    let r_bias = r_bias.get(&params.bias);
 
-    println!("rpi              : {rpi:.2e}");
-    println!("base impedance   : {base_impedance:.2e}");
+    let ree = VT / ie;
+    let rpi = VT * params.beta / params.ic;
+    let zi = match params.bias {
+        BiasConfig::VoltageDivider => {
+            let zb = rpi + (params.beta + 1.0) * re;
+            rpar(r_bias, zb)
+            // rpar(r_bias, params.beta * ree)
+        },
+        BiasConfig::CollectorFeedback => {
+            ree / (1.0 / params.beta + rc / (rc + r_bias))
+        },
+        BiasConfig::EmitterBias => {
+            let zb = params.beta * (re + ree);
+            rpar(r_bias, zb)
+        },
+        BiasConfig::Bootstrap => {
+            rpi + (params.beta + 1.0) * re
+        }
+    };
 
-    println!("input impedance  : {:.2e}", rpar(base_impedance, r_bias));
-    // println!("output impedance : {rout:.2e}");
-    println!("r_bias           : {r_bias:.2e}");
-    println!("input cap        : {:.2e}", rcf(r_bias, params.i_cutoff));
+    println!("zi               : {zi:.2e}");
+    println!("input cap        : {:.2e}", rcf(zi, params.i_cutoff));
 
     match params.mode {
         BjtMode::CommonCollector => {},
@@ -225,26 +287,27 @@ Usage:
     bjt <Commands> <value> <Mode> <Bias>
 
 Commands:
-    -ic       : set the desired collector current (default: 1mA)
-    -beta     : set the current gain (Hfe) (default: 100)
-    -ibias    : set the desired bias current multiplier with regards to base current (default: 10x)
-    -load1    : set the load impedance of the next stage (parallel with output impedance)
-    -load2    : set the load impedance of the next stage (parallel with load1)
-    -icut     : set the desired high pass filter frequency cutoff at the input (default: 1)
-    -ocut     : set the desired high pass filter frequency cutoff at the output (default: 1)
-    -vcc      : set the supply voltage (default: 24)
-    -ve       : set the desired emitter voltage (default: 1)
-    -vbe      : set the vbe drop of the device (default: 0.65)
-    -vbias    : set the bias voltage if any (default: vcc)
+    -ic        : set the desired collector current (default: 1mA)
+    -beta      : set the current gain (Hfe) (default: 100)
+    -ibias     : set the desired bias current multiplier with regards to base current (default: 10x)
+    -load1     : set the load impedance of the next stage (parallel with output impedance)
+    -load2     : set the load impedance of the next stage (parallel with load1)
+    -icut      : set the desired high pass filter frequency cutoff at the input (default: 1)
+    -ocut      : set the desired high pass filter frequency cutoff at the output (default: 1)
+    -vcc       : set the supply voltage (default: 24)
+    -ve        : set the desired emitter voltage (default: 1)
+    -vbe       : set the vbe drop of the device (default: 0.65)
+    -vbias     : set the bias voltage if any (default: vcc)
 
 Mode (default: ce):
-    -cc       : set the mode of the device to common collector
-    -ce       : set the mode of the device to common emitter
+    -cc        : set the mode of the device to common collector
+    -ce        : set the mode of the device to common emitter
 
 Bias (default: voltdiv):
-    -voltdiv  : set the bias configuration to voltage divider bias
-    -feedback : set the bias configuration to collectod feedback resistor
-    -fixed    : set the bias configuration to fixed bias
+    -vdv       : set the bias configuration to voltage divider bias
+    -feedback  : set the bias configuration to collectod feedback resistor
+    -emb       : set the bias configuration to emitter bias
+    -bootstrap : set the bias configuration to bootstrapped bias
 ";
 
 fn main() {
