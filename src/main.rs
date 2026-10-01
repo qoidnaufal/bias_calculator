@@ -24,7 +24,6 @@ struct Params {
     load2:    Option<f64>,
     ic:       f64,
     beta:     f64,
-    ibias_x:  f64,
     i_cutoff: f64,
     o_cutoff: f64,
     rc_lpass: f64,
@@ -43,13 +42,12 @@ impl Default for Params {
             load2:    None,
             ic:       1e-3,
             beta:     1e2,
-            ibias_x:  10.0,
-            i_cutoff: 1.0,
-            o_cutoff: 1.0,
+            i_cutoff: 7.0,
+            o_cutoff: 7.0,
             rc_lpass: 6.6e3,
             vcc:      24.0,
             vbe:      0.65,
-            ve:       1.0,
+            ve:       2.4,
             vbias:    None,
             mode:     BjtMode::CommonEmitter,
             bias:     BiasConfig::VoltageDivider,
@@ -66,7 +64,6 @@ enum BiasConfig {
     VoltageDivider,
     CollectorFeedback,
     EmitterBias,
-    Bootstrap,
 }
 
 fn get_mode_and_bias(mode: &mut BjtMode, bias: &mut BiasConfig, s: &str) -> Result<(), Error> {
@@ -76,7 +73,6 @@ fn get_mode_and_bias(mode: &mut BjtMode, bias: &mut BiasConfig, s: &str) -> Resu
         "-vdv"       => *bias = BiasConfig::VoltageDivider,
         "-feedback"  => *bias = BiasConfig::CollectorFeedback,
         "-emb"       => *bias = BiasConfig::EmitterBias,
-        "-bootstrap" => *bias = BiasConfig::Bootstrap,
         _ => return Err(Error::InvalidArgs(s.to_owned()))
     }
 
@@ -99,14 +95,19 @@ impl core::fmt::Display for BiasConfig {
             BiasConfig::VoltageDivider    => "Voltage Divider",
             BiasConfig::CollectorFeedback => "Collector Feedback",
             BiasConfig::EmitterBias       => "Emitter Bias",
-            BiasConfig::Bootstrap         => "Bootstrap",
         };
         write!(f, "{s}")
     }
 }
 
-fn rpar(r1: f64, r2: f64) -> f64 {
-    r1 * r2 / (r1 + r2)
+macro_rules! rpar {
+    ($($r:expr),* $(,)?) => {{
+        let mut gp: f64 = 0.0;
+        $(
+            gp += 1.0 / $r;
+        )*
+        1.0 / gp
+    }};
 }
 
 fn parse(s: &str) -> Result<f64, Error> {
@@ -125,7 +126,6 @@ fn get_params() -> Result<Params, Error> {
             match cmd[i].as_str() {
                 "-ic"     => { params.ic = parse(&cmd[i + 1])?; i += 1 }
                 "-beta"   => { params.beta = parse(&cmd[i + 1])?; i += 1 },
-                "-ibias"  => { params.ibias_x = parse(&cmd[i + 1])?; i += 1 },
                 "-load1"  => { params.load1 = Some(parse(&cmd[i + 1])?); i += 1 },
                 "-load2"  => { params.load2 = Some(parse(&cmd[i + 1])?); i += 1 },
                 "-icut"   => { params.i_cutoff = parse(&cmd[i + 1])?; i += 1 },
@@ -168,19 +168,8 @@ impl Rbias {
                 let r2 = self.vdv.r2;
                 println!("r1               : {r1:.2e}");
                 println!("r2               : {r2:.2e}");
-                rpar(r1, r2)
-            },
-            BiasConfig::Bootstrap => unsafe {
-                let ib = self.vdv.ibias;
-                let r1 = self.vdv.r1;
-                let r2 = self.vdv.r2;
-                let r3_min = 0.005 / ib;
-                let r3_max = r3_min * 2.0;
-
-                println!("r1               : {r1:.2e}");
-                println!("r2               : {r2:.2e}");
-                println!("r3               : {r3_min:.2e} - {r3_max:.2e}");
-                rpar(r1, r2)
+                println!("ibias            : {:.2e}", self.vdv.ibias);
+                rpar!(r1, r2)
             },
             BiasConfig::CollectorFeedback
             | BiasConfig::EmitterBias => unsafe {
@@ -192,93 +181,171 @@ impl Rbias {
     }
 }
 
-fn analyze(params: &Params) {
-    println!("\x1B[1;32m{}\x1B[0m - \x1B[1;32m{}\x1B[0m", params.mode, params.bias);
-    println!(" ---------------");
+fn select_r2(r2: &mut f64) {
+    use core::str::FromStr;
+    use std::io::{Read, Write};
 
-    let ib = params.ic / params.beta;
-    let ie = params.ic + ib;
-    let re = params.ve / ie;
+    let mut stdin = std::io::stdin();
+
+    loop {
+        print!("Max r2 is: \x1B[1;33m{r2:.2e}\x1B[0m. Pick your desired r2 value: ");
+        std::io::stdout().flush().unwrap();
+        let mut buffer = [0u8; 32];
+        match stdin.read(&mut buffer) {
+            Ok(n) => {
+                if let Ok(Ok(new)) = str::from_utf8(&buffer[..n])
+                    .map(str::trim)
+                    .map(<f64 as FromStr>::from_str)
+                {
+                        let old = *r2;
+                        if new > old {
+                            print!("New r2 exceeds maximum recommended value, \x1B[1;33m{old:.2e}\x1B[0m is used.\n");
+                            std::io::stdout().flush().unwrap();
+                        }
+                        let new_r2 = new.min(old);
+                        *r2 = new_r2;
+                        break;
+                }
+            },
+            Err(_) => {}
+        }
+    }
+}
+
+fn select_re(re: &mut f64) {
+    use core::str::FromStr;
+    use std::io::{Read, Write};
+
+    let mut stdin = std::io::stdin();
+
+    loop {
+        print!("Suggested re is: \x1B[1;33m{re:.2e}\x1B[0m. Pick your desired re value: ");
+        std::io::stdout().flush().unwrap();
+        let mut buffer = [0u8; 32];
+        match stdin.read(&mut buffer) {
+            Ok(n) => {
+                if let Ok(Ok(new)) = str::from_utf8(&buffer[..n])
+                    .map(str::trim)
+                    .map(<f64 as FromStr>::from_str)
+                {
+                        *re = new;
+                        break;
+                }
+            },
+            Err(_) => {}
+        }
+    }
+}
+
+struct Currents {
+    ic: f64,
+    ib: f64,
+    ie: f64,
+}
+
+fn finetune_initial_condition(params: &Params) -> (Currents, f64) {
+    let mut ib = params.ic / params.beta;
+    let mut ie = params.ic + ib;
+    let mut re = params.ve / ie;
+    select_re(&mut re);
+    ie = params.ve / re;
+    ib = ie / (params.beta + 1.0);
+    let ic = ib * params.beta;
+
+    (Currents { ic, ib, ie }, re)
+}
+
+fn analyze(params: &Params) {
+    let (currents, re) = finetune_initial_condition(&params);
     let vb = params.ve + params.vbe;
 
-    let (vce, rc) = match params.mode {
+    let (vc, rc) = match params.mode {
         BjtMode::CommonEmitter => {
             let vrc = (params.vcc - params.ve) / 2.0;
-            let vce = params.vcc - vrc;
+            let vc = params.vcc - vrc;
             let rc = vrc / params.ic;
-            println!("expected vce     : {vce:.2}");
-            println!("expected vb      : {vb:.2}");
-            println!(" ---------------");
-            (vce, rc)
+            (vc, rc)
         },
         BjtMode::CommonCollector => (params.vcc, 0.0),
     };
 
     let vbias = params.vbias.unwrap_or(params.vcc);
 
-    println!("rc               : {rc:.2}");
-    println!("re               : {re:.2}");
-
     let r_bias = match params.bias {
         BiasConfig::VoltageDivider => {
-            let ibias = params.ibias_x * ib;
-            let r1 = (vbias - vb) / (ibias + ib);
-            let r2 = vb / ibias;
+            let mut r2 = 0.1 * params.beta * re;
+            select_r2(&mut r2);
+            let ir2 = vb / r2;
+            let ibias = currents.ib + ir2;
+            let r1 = (vbias - vb) / ibias;
 
             Rbias {
                 vdv: VoltageDivider { r1, r2, ibias }
             }
         },
-        BiasConfig::CollectorFeedback => Rbias { rb: (vce - params.vbe) / ib },
-        BiasConfig::EmitterBias => Rbias { rb: (vbias - vb) / ib },
-        BiasConfig::Bootstrap => {
-            let ibias = params.ibias_x * ib;
-            let r1 = (vbias - vb) / (ibias + ib);
-            let r2 = vb / ibias;
-
-            Rbias {
-                vdv: VoltageDivider { r1, r2, ibias: ib }
-            }
-        }
+        BiasConfig::CollectorFeedback => Rbias { rb: (vc - params.vbe) / currents.ib },
+        BiasConfig::EmitterBias => Rbias { rb: (vbias - vb) / currents.ib },
     };
 
-    let r_bias = r_bias.get(&params.bias);
+    let vce = vc - params.ve;
 
-    let ree = VT / ie;
-    let rpi = VT * params.beta / params.ic;
+    println!("\x1B[1;32m{}\x1B[0m - \x1B[1;32m{}\x1B[0m", params.mode, params.bias);
+    println!("vc               : {vc:.2}");
+    if matches!(params.mode, BjtMode::CommonEmitter) {
+        println!("vce              : {vce:.2}");
+    }
+    println!("ic               : {:.2e}", currents.ic);
+    println!("-----------------------------------");
+
+    if matches!(params.mode, BjtMode::CommonEmitter) {
+        println!("rc               : {rc:.2}");
+    }
+    println!("re               : {re:.2}");
+
+    let r_bias = r_bias.get(&params.bias);
+    let ree = VT / currents.ie;
+    // let ro = vce / params.ic;
+
     let zi = match params.bias {
         BiasConfig::VoltageDivider => {
-            let zb = rpi + (params.beta + 1.0) * re;
-            rpar(r_bias, zb)
-            // rpar(r_bias, params.beta * ree)
+            // let rpi = VT * params.beta / params.ic;
+            // let zb = rpi + (params.beta + 1.0) * re;
+            let zb = params.beta * ree;
+            rpar!(r_bias, zb)
         },
         BiasConfig::CollectorFeedback => {
-            ree / (1.0 / params.beta + rc / (rc + r_bias))
+            let beta_inv = 1.0 / params.beta;
+            let denom = beta_inv + (re + rc) / r_bias;
+            ree / denom
         },
         BiasConfig::EmitterBias => {
-            let zb = params.beta * (re + ree);
-            rpar(r_bias, zb)
+            let zb = params.beta * ree + (params.beta + 1.0) * re;
+            rpar!(r_bias, zb)
         },
-        BiasConfig::Bootstrap => {
-            rpi + (params.beta + 1.0) * re
-        }
+    };
+
+    let zo = match params.bias {
+        BiasConfig::VoltageDivider => rc,
+        BiasConfig::CollectorFeedback => rpar!(r_bias, rc),
+        BiasConfig::EmitterBias => rpar!(re, ree),
     };
 
     println!("zi               : {zi:.2e}");
+    println!("zo               : {zo:.2e}");
     println!("input cap        : {:.2e}", rcf(zi, params.i_cutoff));
 
-    match params.mode {
-        BjtMode::CommonCollector => {},
-        BjtMode::CommonEmitter => {
-            println!("low pass cap     : {:.2e}", rcf(rc, params.rc_lpass));
-        },
+    if matches!(params.mode, BjtMode::CommonEmitter) {
+        println!("low pass cap     : {:.2e}", rcf(rc, params.rc_lpass));
     }
 
-    if let Some(load1) = params.load1 && let Some(load2) = params.load2 {
-        let par = rpar(load1, load2);
-        println!("output cap       : {:.2e}", rcf(par, params.o_cutoff));
-    } else if let Some(load1) = params.load1 {
-        println!("output cap       : {:.2e}", rcf(load1, params.o_cutoff));
+    if let Some(load1) = params.load1 {
+        if let Some(load2) = params.load2 {
+            let par = rpar!(load1, load2);
+            println!("output cap       : {:.2e}", rcf(par, params.o_cutoff));
+        } else {
+            println!("output cap       : {:.2e}", rcf(load1, params.o_cutoff));
+        }
+    } else {
     };
 }
 
@@ -289,7 +356,6 @@ Usage:
 Commands:
     -ic        : set the desired collector current (default: 1mA)
     -beta      : set the current gain (Hfe) (default: 100)
-    -ibias     : set the desired bias current multiplier with regards to base current (default: 10x)
     -load1     : set the load impedance of the next stage (parallel with output impedance)
     -load2     : set the load impedance of the next stage (parallel with load1)
     -icut      : set the desired high pass filter frequency cutoff at the input (default: 1)
@@ -307,7 +373,6 @@ Bias (default: voltdiv):
     -vdv       : set the bias configuration to voltage divider bias
     -feedback  : set the bias configuration to collectod feedback resistor
     -emb       : set the bias configuration to emitter bias
-    -bootstrap : set the bias configuration to bootstrapped bias
 ";
 
 fn main() {
