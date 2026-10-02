@@ -249,7 +249,6 @@ fn emitter_bias_cc(params: &Params) -> Result<(), Error> {
     select("Suggested re", re, |new| re = new)?;
     ie = params.ve / re;
     ib = ie / (params.beta + 1.0);
-    let ic = ib * params.beta;
 
     let vb = params.vb();
 
@@ -257,12 +256,13 @@ fn emitter_bias_cc(params: &Params) -> Result<(), Error> {
     select("Suggested rb", rb, |new| rb = new)?;
     let ree = VT / ie;
 
-    let zi = rpar!(params.beta * ree, rb);
+    let zb = params.beta * ree + (params.beta + 1.0) * re;
+    let zi = rpar!(zb, rb);
     let zo = rpar!(re, ree);
     let input_cap = rcf(zi, params.i_cutoff);
 
     print_mode(&params.mode, &params.bias);
-    println!("ic               : {ic:.2e}");
+    println!("ic               : {:.2e}", params.ic);
     println!("ib               : {ib:.2e}");
     println!("-----------------------------------");
     println!("re               : {re:.2e}");
