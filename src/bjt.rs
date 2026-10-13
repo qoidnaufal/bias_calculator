@@ -10,12 +10,12 @@ const CHARGE:      f64 = 1.602176634e-19;
 const TEMPERATURE: f64 = 300.15;
 const VT:          f64 = BOLTZMANN * TEMPERATURE / CHARGE;
 
-// fn gain(rc: f64, re: f64, ree: f64) -> f64 {
-//     rc / (re + ree)
+// fn ac_gain(zo: f64, re: f64, ree: f64) -> f64 {
+//     zo / (re + ree)
 // }
 
 pub(crate) struct Params {
-    load:     Option<f64>,
+    // load:     Option<f64>,
     ic:       f64,
     beta:     f64,
     hpass:    f64,
@@ -32,7 +32,7 @@ pub(crate) struct Params {
 impl Default for Params {
     fn default() -> Self {
         Self {
-            load:     None,
+            // load:     None,
             ic:       1e-3,
             beta:     1e2,
             hpass:    7.0,
@@ -96,7 +96,7 @@ impl Params {
                 let n = stdin.read(&mut buffer).ok()?;
                 if let Ok(s) = str::from_utf8(&buffer[..n]).map(str::trim) {
                     match s {
-                        "quit" | "q" => {
+                        "q" | "quit" => {
                             println!("Aborted");
                             return None;
                         },
@@ -133,13 +133,13 @@ enum Boost {
 }
 
 impl Boost {
-    fn analyze(&self, rc: f64, re: f64, ree: f64) -> Result<crate::valve::RCBypass, Error> {
+    fn analyze(&self, rc: f64, re: f64, ree: f64) -> Result<crate::valve::ACNetwork, Error> {
         match self {
-            Boost::ValveBased(valve_params) => valve_params.analyze_bjt(rc, re, ree),
+            Boost::ValveBased(valve) => valve.ac_analysis(rc, re, ree),
             Boost::PlainBoost(hz) => {
                 let ze = rpar!(re, ree);
                 let c_bypass = rcf(ze, *hz);
-                Ok(crate::valve::RCBypass {
+                Ok(crate::valve::ACNetwork {
                     r_bypass: 0.0,
                     c_bypass,
                 })
@@ -185,13 +185,13 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
     let ree = VT / ie;
 
     let beta_inv = 1.0 / params.beta;
-    let denom = beta_inv + (re + rc) / rf;
-    let zi = ree / denom;
+    let denom = beta_inv + (rc + re + ree) / rf;
+    let zi = (re + ree) / denom;
     let zo = rpar!(rf, rc);
 
     let input_cap = rcf(zi, params.hpass);
     let low_pass_cap = rcf(zo, params.lpass);
-    let rc_bypass = params.check_boost().map(|boost| boost.analyze(rc, re, ree));
+    let rc_bypass = params.check_boost().map(|boost| boost.analyze(zo, re, ree));
 
     print_mode(&params.mode, &params.bias);
     print!("vc               : {vc:.2}\n");
@@ -209,8 +209,7 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
 
     if let Some(bypass) = rc_bypass {
         if let Ok(bypass) = bypass {
-            print!("r_bypass         : {:.2e}\n", bypass.r_bypass);
-            print!("c_bypass         : {:.2e}\n", bypass.c_bypass);
+            print!("{bypass:?}\n");
         }
     }
 
@@ -254,13 +253,14 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let ree = VT / ie;
 
     let beta_inv = 1.0 / params.beta;
-    let denom = beta_inv + (re + rc) / rf;
-    let zi = ree / denom;
+    let denom = beta_inv + (rc + re + ree) / rf;
+    let zi0 = (re + ree) / denom;
+    let zi = rpar!(zi0, r2);
     let zo = rpar!(rf, rc);
 
     let input_cap = rcf(zi, params.hpass);
     let low_pass_cap = rcf(zo, params.lpass);
-    let rc_bypass = params.check_boost().map(|boost| boost.analyze(rc, re, ree));
+    let rc_bypass = params.check_boost().map(|boost| boost.analyze(zo, re, ree));
 
     print_mode(&params.mode, &params.bias);
     print!("vc               : {vc:.2}\n");
@@ -281,8 +281,7 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
 
     if let Some(bypass) = rc_bypass {
         if let Ok(bypass) = bypass {
-            print!("r_bypass         : {:.2e}\n", bypass.r_bypass);
-            print!("c_bypass         : {:.2e}\n", bypass.c_bypass);
+            print!("{bypass:?}\n");
         }
     }
 
@@ -323,7 +322,7 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     let r_bias = rpar!(r1, r2);
     let ree = VT / ie;
 
-    let zi = rpar!(params.beta * ree, r_bias);
+    let zi = rpar!(params.beta * (re + ree), r_bias);
     let input_cap = rcf(zi, params.hpass);
     let low_pass_cap = rcf(rc, params.lpass);
     let rc_bypass = params.check_boost().map(|boost| boost.analyze(rc, re, ree));
@@ -346,8 +345,7 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
 
     if let Some(bypass) = rc_bypass {
         if let Ok(bypass) = bypass {
-            print!("r_bypass         : {:.2e}\n", bypass.r_bypass);
-            print!("c_bypass         : {:.2e}\n", bypass.c_bypass);
+            print!("{bypass:?}\n");
         }
     }
 
@@ -384,7 +382,8 @@ fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
     let r_bias = rpar!(r1, r2);
     let ree = VT / ie;
 
-    let zi = rpar!(params.beta * ree, r_bias);
+    let zb = (params.beta + 1.0) * (re + ree);
+    let zi = rpar!(zb, r_bias);
     let zo = rpar!(re, ree);
     let input_cap = rcf(zi, params.hpass);
 
@@ -417,14 +416,15 @@ fn emitter_bias_cc(params: &Params) -> Result<(), Error> {
     select("Suggested rb", rb, |new| Ok(rb = new))?;
     let ree = VT / ie;
 
-    let zb = params.beta * ree + (params.beta + 1.0) * re;
+    // let zb = params.beta * ree + (params.beta + 1.0) * re;
+    let zb = (params.beta + 1.0) * (re + ree);
     let zi = rpar!(zb, rb);
     let zo = rpar!(re, ree);
     let input_cap = rcf(zi, params.hpass);
 
     print_mode(&params.mode, &params.bias);
-    print!("ic               : {:.2e}\n", params.ic);
     print!("ib               : {ib:.2e}\n");
+    print!("ic               : {:.2e}\n", ib * params.beta);
     print!("-----------------------------------\n");
     print!("re               : {re:.2e}\n");
     print!("rb               : {rb:.2e}\n");
@@ -456,7 +456,7 @@ pub(crate) fn get_params() -> Result<Params, Error> {
             match cmd[i].as_str() {
                 "-ic"              => { params.ic = parse(&cmd[i + 1])?; i += 1 }
                 "-beta" | "-hfe"   => { params.beta = parse(&cmd[i + 1])?; i += 1 },
-                "-load"            => { params.load = Some(parse(&cmd[i + 1])?); i += 1 },
+                // "-load"            => { params.load = Some(parse(&cmd[i + 1])?); i += 1 },
                 "-hpass"           => { params.hpass = parse(&cmd[i + 1])?; i += 1 },
                 "-lpass"           => { params.lpass = parse(&cmd[i + 1])?; i += 1 },
                 "-vcc"             => { params.vcc = parse(&cmd[i + 1])?; i += 1 },
