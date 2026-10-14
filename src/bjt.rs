@@ -10,10 +10,6 @@ const CHARGE:      f64 = 1.602176634e-19;
 const TEMPERATURE: f64 = 300.15;
 const VT:          f64 = BOLTZMANN * TEMPERATURE / CHARGE;
 
-// fn ac_gain(zo: f64, re: f64, ree: f64) -> f64 {
-//     zo / (re + ree)
-// }
-
 pub(crate) struct Params {
     // load:     Option<f64>,
     ic:       f64,
@@ -25,6 +21,8 @@ pub(crate) struct Params {
     ve:       f64,
     vbias:    Option<f64>,
     boost:    bool,
+    cgk:      bool,
+    cpg:      bool,
     mode:     BjtMode,
     bias:     BiasConfig,
 }
@@ -42,6 +40,8 @@ impl Default for Params {
             ve:       2.0,
             vbias:    None,
             boost:    false,
+            cgk:      false,
+            cpg:      false,
             mode:     BjtMode::CommonEmitter,
             bias:     BiasConfig::VoltageDivider,
         }
@@ -50,7 +50,7 @@ impl Default for Params {
 
 pub(crate) fn analyze(params: &Params) -> Result<(), Error> {
     match params.mode {
-        BjtMode::CommonEmitter => match params.bias {
+        BjtMode::CommonEmitter   => match params.bias {
             BiasConfig::VoltageDivider              => voltage_divider_ce(params)?,
             BiasConfig::CollectorFeedback           => collector_feedback(params)?,
             BiasConfig::CollectorFeedbackDivider    => collector_feedback_divider(params)?,
@@ -100,7 +100,7 @@ impl Params {
                             println!("Aborted");
                             return None;
                         },
-                        "y" | "yes" => return ValveParams::get().ok().map(Boost::ValveBased),
+                        "y" | "yes" => return ValveParams::get(self.cgk, self.cpg).ok().map(Boost::ValveBased),
                         "n" | "no" => {
                             print!("Set the cutoff frequency: ");
                             std::io::stdout().flush().ok()?;
@@ -121,10 +121,6 @@ impl Params {
             None
         }
     }
-
-    // fn rpi(&self) -> f64 {
-    //     self.beta * (VT / self.ic)
-    // }
 }
 
 enum Boost {
@@ -142,6 +138,8 @@ impl Boost {
                 Ok(crate::valve::ACNetwork {
                     r_bypass: 0.0,
                     c_bypass,
+                    cbe: None,
+                    cbc: None,
                 })
             },
         }
@@ -206,6 +204,7 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
     print!("zo               : {zo:.2e}\n");
     print!("input cap        : {input_cap:.2e}\n");
     print!("low pass cap     : {low_pass_cap:.2e}\n");
+    print!("ree              : {ree:.2e}\n");
 
     if let Some(bypass) = rc_bypass {
         if let Ok(bypass) = bypass {
@@ -233,19 +232,19 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let vb = params.vb();
     let vc = params.vcc - vrc;
 
-    let mut r2 = 0.1 * params.beta * re;
-    select("Max r2", r2, |new| {
-        if new > r2 {
-            print!("New r2 exceeds maximum recommended value.\n");
+    let mut rbg = 0.1 * params.beta * re;
+    select("Max rbg", rbg, |new| {
+        if new > rbg {
+            print!("New rbg exceeds maximum recommended value.\n");
             std::io::stdout().flush().unwrap();
             Err(SelectError)
         } else {
-            r2 = new.min(r2);
+            rbg = new;
             Ok(())
         }
     })?;
 
-    let ir2 = vb / r2;
+    let ir2 = vb / rbg;
     let irf = ib + ir2;
     let rf = (vc - vb) / irf;
     let irc = irf + ic;
@@ -255,7 +254,7 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let beta_inv = 1.0 / params.beta;
     let denom = beta_inv + (rc + re + ree) / rf;
     let zi0 = (re + ree) / denom;
-    let zi = rpar!(zi0, r2);
+    let zi = rpar!(zi0, rbg);
     let zo = rpar!(rf, rc);
 
     let input_cap = rcf(zi, params.hpass);
@@ -272,7 +271,7 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     print!("rc               : {rc:.2e}\n");
     print!("re               : {re:.2e}\n");
     print!("rf               : {rf:.2e}\n");
-    print!("r2               : {r2:.2e}\n");
+    print!("rbg              : {rbg:.2e}\n");
     print!("zi               : {zi:.2e}\n");
     print!("zo               : {zo:.2e}\n");
     print!("input cap        : {input_cap:.2e}\n");
@@ -341,7 +340,7 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     print!("zo               : {rc:.2e}\n");
     print!("input cap        : {input_cap:.2e}\n");
     print!("low pass cap     : {low_pass_cap:.2e}\n");
-    print!("re || ree        : {:.2e}\n", rpar!(re, ree));
+    print!("ree              : {ree:.2e}\n");
 
     if let Some(bypass) = rc_bypass {
         if let Ok(bypass) = bypass {
@@ -444,7 +443,6 @@ pub(crate) fn get_params() -> Result<Params, Error> {
 
     if let Some(cmd) = args.get(1..) {
         let len = cmd.len();
-        let mut i = 0;
 
         let beta = String::from("-beta");
         let hfe = String::from("-hfe");
@@ -452,9 +450,10 @@ pub(crate) fn get_params() -> Result<Params, Error> {
             return Err(Error::InvalidArgs("Both beta & hfe are defined at the same time, use only one of them.".to_owned()))
         }
 
+        let mut i = 0;
         while i < len {
             match cmd[i].as_str() {
-                "-ic"              => { params.ic = parse(&cmd[i + 1])?; i += 1 }
+                "-ic"              => { params.ic = parse(&cmd[i + 1])?; i += 1 },
                 "-beta" | "-hfe"   => { params.beta = parse(&cmd[i + 1])?; i += 1 },
                 // "-load"            => { params.load = Some(parse(&cmd[i + 1])?); i += 1 },
                 "-hpass"           => { params.hpass = parse(&cmd[i + 1])?; i += 1 },
@@ -481,6 +480,8 @@ fn get_mode_and_bias(params: &mut Params, s: &str) -> Result<(), Error> {
         "-cfdiv"         => params.bias = BiasConfig::CollectorFeedbackDivider,
         "-emb"           => params.bias = BiasConfig::EmitterBias,
         "-boost"         => params.boost = true,
+        "-cgk"           => params.cgk = true,
+        "-cpg"           => params.cpg = true,
         "-h" | "--help"  => return Err(Error::NeedsHelp),
         _                => return Err(Error::InvalidArgs(s.to_owned()))
     }

@@ -78,7 +78,9 @@ Commands
     -vbias      : set the bias voltage if any (default: vcc)
     -hpass      : set the desired hi-pass filter frequency cutoff at the input (default: 7Hz)
     -lpass      : set the desired lo-pass filter for the collector-bypass or the collector-feedback capacitor (default: 20kHz)
-    -boost      : set to bypass the emitter resistor
+    -boost      : this is used if you want to emulate the boost provided by cathode bypass capacitor on a 12ax7
+    -cgk        : this is used if you want to emulate the frequency roll-off by a capacitor connected between grid and cathode on a 12ax7
+    -cpg        : this is used if you want to emulate the frequency roll-off by a capacitor connected between plate and vsupply / ground on a 12ax7
 
 Mode (default: ce)
     -cc         : set the mode of the device to common collector

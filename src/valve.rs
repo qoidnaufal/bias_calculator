@@ -4,10 +4,6 @@ use core::str::FromStr;
 use crate::{Error};
 use crate::{rpar, rcf};
 
-// const CGK:    f64 = 2.3e-12;
-// const CGP:    f64 = 2.4e-12;
-// const CPK:    f64 = 0.9e-12;
-
 const MU:     f64 = 103.2;
 const MU_P1:  f64 = MU + 1.0;
 
@@ -83,7 +79,8 @@ pub(crate) struct ValveParams {
     rp: f64,
     rk: f64,
     ck: f64,
-    // cgk: f64,
+    cgk: Option<f64>,
+    cpg: Option<f64>,
 }
 
 // fn bypassed_gain(rp: f64, rpp: f64) -> f64 {
@@ -98,13 +95,16 @@ pub(crate) struct ValveParams {
 /// bypassed   = MU * rp / (rp + rpp)
 /// unbypassed = MU * rp / rp + rpp + (MU_P1 * rk)
 /// ratio      = bypassed / unbypassed
+/// (rp + rpp + (MU_P1 * rk)) / (rp + rpp)
+/// = a + (MU_P1 * rk) / a
+/// = 1 + (MU_P1 * rk / a)
 fn gain_ratio(rp: f64, rpp: f64, rk: f64) -> f64 {
-    let r_plate = rp + rpp;
-    1.0 + MU_P1 * rk / r_plate
+    let a = rp + rpp;
+    1.0 + (MU_P1 * rk / a)
 }
 
 impl ValveParams {
-    pub(crate) fn get() -> Result<Self, Error> {
+    pub(crate) fn get(with_cgk: bool, with_cpg: bool) -> Result<Self, Error> {
         let mut this = ValveParams::default();
 
         select("v_supply", |vs| this.vs = vs)?;
@@ -112,12 +112,17 @@ impl ValveParams {
         select("Plate resistor", |rp| this.rp = rp)?;
         select("Cathode resistor", |rk| this.rk = rk)?;
         select("Cathode bypass capacitor", |ck| this.ck = ck)?;
-        // select("cgk", |cgk| this.cgk = cgk)?;
+        if with_cgk { select("cgk", |cgk| this.cgk = Some(cgk))? }
+        if with_cpg { select("cpg", |cpg| this.cpg = Some(cpg))? }
 
         Ok(this)
     }
 
     pub(crate) fn ac_analysis(&self, zo: f64, re: f64, ree: f64) -> Result<ACNetwork, Error> {
+        const CGK:    f64 = 2.3e-12;
+        const CGP:    f64 = 2.4e-12;
+        // const CPK:    f64 = 0.9e-12;
+
         let ik = self.vk / self.rk;
         let vrp = self.rp * ik;
         let vp = self.vs - vrp;
@@ -145,20 +150,24 @@ impl ValveParams {
         let ze = rpar!(re, ree);
         let c_bypass = rcf(r_bypass + ze, boosted_freq);
 
-        // let gk_roll_off = rcf(rk_eq, CGK + self.cgk);
-        // let mut cbe = rcf(ze, gk_roll_off);
-        // crate::bjt::select("Suggested base-emitter capacitor", cbe, |new| Ok(cbe = new))?;
+        let mut cbe = None;
+        if let Some(cgk) = self.cgk {
+            let gk_roll_off = rcf(rk_eq, CGK + cgk);
+            cbe = Some(rcf(ze, gk_roll_off))
+        }
 
-        // let rp_eq = rpar!(self.rp, rpp);
-        // let gp_roll_off = rcf(rp_eq, CGP);
-        // let mut cbc = rcf(zo, gp_roll_off);
-        // crate::bjt::select("Suggested collector capacitor", cbc, |new| Ok(cbc = new))?;
+        let mut cbc = None;
+        if let Some(cpg) = self.cpg {
+            let rp_eq = rpar!(self.rp, rpp);
+            let gp_roll_off = rcf(rp_eq, CGP + cpg);
+            cbc = Some(rcf(zo, gp_roll_off))
+        }
 
         Ok(ACNetwork {
             r_bypass,
             c_bypass,
-            // cbe,
-            // cbc,
+            cbe,
+            cbc,
         })
     }
 }
@@ -166,13 +175,21 @@ impl ValveParams {
 pub(crate) struct ACNetwork {
     pub(crate) r_bypass: f64,
     pub(crate) c_bypass: f64,
-    // pub(crate) cbe: f64,
-    // pub(crate) cbc: f64,
+    pub(crate) cbe: Option<f64>,
+    pub(crate) cbc: Option<f64>,
 }
 
 impl core::fmt::Debug for ACNetwork {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "r_bypass         : {:.2e}\n", self.r_bypass)?;
-        write!(f, "c_bypass         : {:.2e}", self.c_bypass)
+        write!(f, "c_bypass         : {:.2e}", self.c_bypass)?;
+        if let Some(cbe) = self.cbe {
+            write!(f, "\nc_be             : {cbe:.2e}")?;
+        }
+        if let Some(cbc) = self.cbc {
+            write!(f, "\nc_bc             : {cbc:.2e}")?;
+        }
+
+        Ok(())
     }
 }
