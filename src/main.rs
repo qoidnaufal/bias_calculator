@@ -8,13 +8,9 @@ const PI2: f64 = 2.0 * core::f64::consts::PI;
 #[macro_export]
 macro_rules! rpar {
     ($($r:expr),* $(,)?) => {{
-        let mut numer: f64 = 1.0;
-        let mut denom: f64 = 0.0;
-        $(
-            numer *= $r;
-            denom += $r;
-        )*
-        numer/denom
+        let mut g = 0.0;
+        $(g += 1.0/$r;)*
+        1.0/g
     }};
 }
 
@@ -73,7 +69,7 @@ Commands
     -beta, -hfe : set the current gain (Hfe) (default: 100)
     -load       : set the load impedance of the next stage (default: None)
     -vcc        : set the supply voltage (default: 24)
-    -ve         : set the desired emitter voltage (default: 2.4)
+    -ve         : set the desired emitter voltage (default: 2)
     -vbe        : set the vbe drop of the device (default: 0.65)
     -vbias      : set the bias voltage if any (default: vcc)
     -hpass      : set the desired hi-pass filter frequency cutoff at the input (default: 7Hz)

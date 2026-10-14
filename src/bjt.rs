@@ -19,6 +19,7 @@ pub(crate) struct Params {
     vcc:      f64,
     vbe:      f64,
     ve:       f64,
+    // vaf:      f64,
     vbias:    Option<f64>,
     boost:    bool,
     cgk:      bool,
@@ -38,6 +39,7 @@ impl Default for Params {
             vcc:      24.0,
             vbe:      0.65,
             ve:       2.0,
+            // vaf:      0.0,
             vbias:    None,
             boost:    false,
             cgk:      false,
@@ -162,6 +164,19 @@ fn print_mode(mode: &BjtMode, bias: &BiasConfig) {
     println!("\x1B[1;32m{}\x1B[0m - \x1B[1;32m{}\x1B[0m", mode, bias);
 }
 
+// /// ro = vaf / ic
+// fn zi_cf(beta: f64, rc: f64, rf: f64, re: f64, ree: f64, ro: f64) -> f64 {
+//     let b  = beta + 1.0;
+//     let zb = b * (re + ree);
+
+//     let n0 = rc*re*rf + b*ree*(rc*re + rc*rf + re*rf);
+//     let d0 = rf*(rc + re) + b*ree*(rc + re);
+//     let n1 = zb * (rc + rf);
+//     let d1 = rf + b*(rc + re + ree);
+
+//     (ro*n1 + n0) / (ro*d1 + d0)
+// }
+
 /// Only works in common emitter mode,
 /// Vcc - Ibc * Rc - Ib * Rf - Vbe - Ie * Re = 0
 fn collector_feedback(params: &Params) -> Result<(), Error> {
@@ -181,10 +196,14 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
 
     let rf = (vc - vb) / ib;
     let ree = VT / ie;
+    // let ro = params.vaf / ic;
 
-    let beta_inv = 1.0 / params.beta;
-    let denom = beta_inv + (rc + re + ree) / rf;
-    let zi = (re + ree) / denom;
+    let alpha = params.beta + 1.0;
+    let zb = alpha * (re + ree);
+    let zi = zb * (rc + rf) / (rf + zb + alpha * rc);
+    // let beta_inv = 1.0 / params.beta;
+    // let denom = beta_inv + (rc + re + ree) / rf;
+    // let zi = (re + ree) / denom;
     let zo = rpar!(rf, rc);
 
     let input_cap = rcf(zi, params.hpass);
@@ -251,10 +270,13 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let rc = vrc / irc;
     let ree = VT / ie;
 
-    let beta_inv = 1.0 / params.beta;
-    let denom = beta_inv + (rc + re + ree) / rf;
-    let zi0 = (re + ree) / denom;
-    let zi = rpar!(zi0, rbg);
+    // let beta_inv = 1.0 / params.beta;
+    // let denom = beta_inv + (rc + re + ree) / rf;
+    let alpha = params.beta + 1.0;
+    let zb = alpha * (re + ree);
+    let zi_feedback = zb * (rc + rf) / (rf + zb + alpha * rc);
+    // let zi0 = (re + ree) / denom;
+    let zi = rpar!(zi_feedback, rbg);
     let zo = rpar!(rf, rc);
 
     let input_cap = rcf(zi, params.hpass);
