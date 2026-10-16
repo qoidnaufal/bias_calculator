@@ -30,6 +30,7 @@ pub(crate) fn parse(s: &str) -> Result<f64, Error> {
 enum Error {
     UnableToParseFloat(String),
     InvalidArgs(String),
+    Other(String),
     NeedsHelp,
     DiscouragedMode,
     Aborted,
@@ -41,6 +42,7 @@ impl core::fmt::Display for Error {
         match self {
             Error::UnableToParseFloat(msg) => write!(f, "Unable to parse float: {msg}"),
             Error::InvalidArgs(msg)        => write!(f, "Invalid args: {msg}"),
+            Error::Other(msg)              => write!(f, "Other: {msg}"),
             Error::NeedsHelp               => write!(f, "Needs help"),
             Error::DiscouragedMode         => write!(f, "This mode & bias is discouraged"),
             Error::Aborted                 => write!(f, "Aborted"),
@@ -86,6 +88,7 @@ Bias (default: voltdiv)
     -vdiv       : set the bias configuration to voltage divider bias
     -cfb        : set the bias configuration to collector feedback resistor
     -cfdiv      : set the bias configuration to collector feedback resistor with a base shunt-resistor
+    -split      : set the bias configuration to split collector feedback with shunt network in between 2 feedback resistors
     -emb        : set the bias configuration to emitter bias
 
 Example:

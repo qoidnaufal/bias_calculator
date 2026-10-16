@@ -56,12 +56,14 @@ pub(crate) fn analyze(params: &Params) -> Result<(), Error> {
             BiasConfig::VoltageDivider              => voltage_divider_ce(params)?,
             BiasConfig::CollectorFeedback           => collector_feedback(params)?,
             BiasConfig::CollectorFeedbackDivider    => collector_feedback_divider(params)?,
+            BiasConfig::CollectorFeedbackSplit      => split_collector_feedback(params)?,
             BiasConfig::EmitterBias                 => return Err(Error::DiscouragedMode),
         },
         BjtMode::CommonCollector => match params.bias {
             BiasConfig::VoltageDivider              => voltage_divider_cc(params)?,
             BiasConfig::CollectorFeedback
-            | BiasConfig::CollectorFeedbackDivider  => return Err(Error::DiscouragedMode),
+            | BiasConfig::CollectorFeedbackDivider
+            | BiasConfig::CollectorFeedbackSplit    => return Err(Error::DiscouragedMode),
             BiasConfig::EmitterBias                 => emitter_bias_cc(params)?,
         },
     }
@@ -84,6 +86,10 @@ impl Params {
 
     fn ib(&self) -> f64 {
         self.ic / self.beta
+    }
+
+    fn alpha(&self) -> f64 {
+        self.beta + 1.0
     }
 
     fn check_boost(&self) -> Option<Boost> {
@@ -157,6 +163,7 @@ enum BiasConfig {
     VoltageDivider,
     CollectorFeedback,
     CollectorFeedbackDivider,
+    CollectorFeedbackSplit,
     EmitterBias,
 }
 
@@ -180,6 +187,7 @@ fn print_mode(mode: &BjtMode, bias: &BiasConfig) {
 /// Only works in common emitter mode,
 /// Vcc - Ibc * Rc - Ib * Rf - Vbe - Ie * Re = 0
 fn collector_feedback(params: &Params) -> Result<(), Error> {
+    let alpha = params.alpha();
     let mut ib = params.ib();
     let mut ie = params.ic + ib;
     let mut re = params.ve / ie;
@@ -198,12 +206,8 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
     let ree = VT / ie;
     // let ro = params.vaf / ic;
 
-    let alpha = params.beta + 1.0;
     let zb = alpha * (re + ree);
     let zi = zb * (rc + rf) / (rf + zb + alpha * rc);
-    // let beta_inv = 1.0 / params.beta;
-    // let denom = beta_inv + (rc + re + ree) / rf;
-    // let zi = (re + ree) / denom;
     let zo = rpar!(rf, rc);
 
     let input_cap = rcf(zi, params.hpass);
@@ -239,12 +243,13 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
 /// Only works in common emitter mode,
 /// Vcc - Ic * Rc - Irf * Rf - (Irf-Ib * R2) - Vbe - Ie * Re = 0
 fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
+    let alpha = params.alpha();
     let mut ib = params.ib();
     let mut ie = params.ic + ib;
     let mut re = params.ve / ie;
     select("Suggested re", re, |new| Ok(re = new))?;
     ie = params.ve / re;
-    ib = ie / (params.beta + 1.0);
+    ib = ie / alpha;
     let ic = ib * params.beta;
 
     let vrc = params.vrc();
@@ -270,12 +275,8 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let rc = vrc / irc;
     let ree = VT / ie;
 
-    // let beta_inv = 1.0 / params.beta;
-    // let denom = beta_inv + (rc + re + ree) / rf;
-    let alpha = params.beta + 1.0;
     let zb = alpha * (re + ree);
     let zi_feedback = zb * (rc + rf) / (rf + zb + alpha * rc);
-    // let zi0 = (re + ree) / denom;
     let zi = rpar!(zi_feedback, rbg);
     let zo = rpar!(rf, rc);
 
@@ -311,6 +312,103 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     Ok(())
 }
 
+/// Only works in common emitter mode,
+fn split_collector_feedback(params: &Params) -> Result<(), Error> {
+    let alpha = params.alpha();
+    let mut ib = params.ib();
+    let mut ie = params.ic + ib;
+    let mut re = params.ve / ie;
+    select("Suggested re", re, |new| Ok(re = new))?;
+    ie = params.ve / re;
+    ib = ie / alpha;
+    let ic = ib * params.beta;
+
+    let vrc = params.vrc();
+    let vb = params.vb();
+    let vc = params.vcc - vrc;
+
+    let max_v_split = (vc / 2.0) - vb;
+
+    if max_v_split <= 0.0 {
+        return Err(Error::Other("Not enough room for split network, readjust your params".to_owned()))
+    }
+
+    let mut rb = max_v_split / ib;
+    select("Max rb", rb, |new| {
+        if new > rb {
+            print!("New rb exceeds maximum recommended value.\n");
+            std::io::stdout().flush().unwrap();
+            Err(SelectError)
+        } else {
+            rb = new;
+            Ok(())
+        }
+    })?;
+
+    let v_split = ib.mul_add(rb, vb);
+    let mut rfg = v_split / (10.0 * ib);
+    select("Max rfg", rfg, |new| {
+        if new > rfg {
+            print!("New rfg exceeds maximum recommended value.\n");
+            std::io::stdout().flush().unwrap();
+            Err(SelectError)
+        } else {
+            rfg = new;
+            Ok(())
+        }
+    })?;
+
+    let irfg = v_split / rfg;
+    let irfc = irfg + ib;
+    let rfc = (vc - v_split) / irfc;
+    let irc = irfc + ic;
+    let rc = vrc / irc;
+    let ree = VT / ie;
+
+    let zb = alpha * (re + ree);
+    let zi = rpar!(rb, zb);
+    let zo = rpar!(rfc, rc);
+
+    let input_cap = rcf(zi, params.hpass);
+    let low_pass_cap = rcf(zo, params.lpass);
+
+    let mut shunt_freq = 7.0;
+    select("Default shunted freq", shunt_freq, |new| Ok(shunt_freq = new))?;
+    let z_shunt = rpar!(rfg, rfc, (rb + zb));
+    let shunt_cap = rcf(z_shunt, shunt_freq);
+
+    let rc_bypass = params.check_boost().map(|boost| boost.analyze(zo, re, ree));
+
+    print_mode(&params.mode, &params.bias);
+    print!("vc               : {vc:.2}\n");
+    print!("ic               : {ic:.2e}\n");
+    print!("irc              : {irc:.2e}\n");
+    print!("irfc             : {irfc:.2e}\n");
+    print!("vce              : {:.2}\n", vc - params.ve);
+    print!("-----------------------------------\n");
+    print!("rc               : {rc:.2e}\n");
+    print!("re               : {re:.2e}\n");
+    print!("rfg              : {rfg:.2e}\n");
+    print!("rfc              : {rfc:.2e}\n");
+    print!("rb               : {rb:.2e}\n");
+    print!("zi               : {zi:.2e}\n");
+    print!("zo               : {zo:.2e}\n");
+    print!("input cap        : {input_cap:.2e}\n");
+    print!("low pass cap     : {low_pass_cap:.2e}\n");
+    print!("shunt cap        : {shunt_cap:.2e}\n");
+    print!("ree              : {ree:.2e}\n");
+
+    if let Some(bypass) = rc_bypass {
+        if let Ok(bypass) = bypass {
+            print!("{bypass:?}\n");
+        }
+    }
+
+    std::io::stdout().flush()?;
+
+    Ok(())
+}
+
 fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     let mut ib = params.ib();
     let mut ie = params.ic + ib;
@@ -332,7 +430,7 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
             std::io::stdout().flush().unwrap();
             Err(SelectError)
         } else {
-            r2 = new.min(r2);
+            r2 = new;
             Ok(())
         }
     })?;
@@ -393,7 +491,7 @@ fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
             std::io::stdout().flush().unwrap();
             Err(SelectError)
         } else {
-            r2 = new.min(r2);
+            r2 = new;
             Ok(())
         }
     })?;
@@ -500,6 +598,7 @@ fn get_mode_and_bias(params: &mut Params, s: &str) -> Result<(), Error> {
         "-vdiv"          => params.bias = BiasConfig::VoltageDivider,
         "-cfb"           => params.bias = BiasConfig::CollectorFeedback,
         "-cfdiv"         => params.bias = BiasConfig::CollectorFeedbackDivider,
+        "-split"         => params.bias = BiasConfig::CollectorFeedbackSplit,
         "-emb"           => params.bias = BiasConfig::EmitterBias,
         "-boost"         => params.boost = true,
         "-cgk"           => params.cgk = true,
@@ -552,6 +651,7 @@ impl core::fmt::Display for BiasConfig {
             BiasConfig::VoltageDivider           => "Voltage Divider",
             BiasConfig::CollectorFeedback        => "Collector Feedback",
             BiasConfig::CollectorFeedbackDivider => "Collector Feedback Divider",
+            BiasConfig::CollectorFeedbackSplit   => "Collector Feedback Split",
             BiasConfig::EmitterBias              => "Emitter Bias",
         };
         write!(f, "{s}")
