@@ -5,13 +5,12 @@ use crate::{Error, SelectError};
 use crate::{rpar, rcf, parse};
 use crate::valve::ValveParams;
 
-const BOLTZMANN:   f64 = 1.380649e-23;
-const CHARGE:      f64 = 1.602176634e-19;
-const TEMPERATURE: f64 = 300.15;
-const VT:          f64 = BOLTZMANN * TEMPERATURE / CHARGE;
+pub(crate) const BOLTZMANN:   f64 = 1.380649e-23;
+pub(crate) const CHARGE:      f64 = 1.602176634e-19;
+pub(crate) const TEMPERATURE: f64 = 300.15;
+pub(crate) const VT:          f64 = BOLTZMANN * TEMPERATURE / CHARGE;
 
 pub(crate) struct Params {
-    // load:     Option<f64>,
     ic:       f64,
     beta:     f64,
     hpass:    f64,
@@ -19,11 +18,9 @@ pub(crate) struct Params {
     vcc:      f64,
     vbe:      f64,
     ve:       f64,
-    // vaf:      f64,
+    vc:       Option<f64>,
     vbias:    Option<f64>,
-    boost:    bool,
-    cgk:      bool,
-    cpg:      bool,
+    boost:    u8,
     mode:     BjtMode,
     bias:     BiasConfig,
 }
@@ -31,19 +28,16 @@ pub(crate) struct Params {
 impl Default for Params {
     fn default() -> Self {
         Self {
-            // load:     None,
             ic:       1e-3,
             beta:     1e2,
             hpass:    7.0,
             lpass:    20e3,
             vcc:      24.0,
             vbe:      0.65,
+            vc:       None,
             ve:       2.0,
-            // vaf:      0.0,
             vbias:    None,
-            boost:    false,
-            cgk:      false,
-            cpg:      false,
+            boost:    0,
             mode:     BjtMode::CommonEmitter,
             bias:     BiasConfig::VoltageDivider,
         }
@@ -76,8 +70,14 @@ impl Params {
         self.ve + self.vbe
     }
 
-    fn vrc(&self) -> f64 {
-        (self.vcc - self.ve) / 2.0
+    fn vc_vrc(&self) -> (f64, f64) {
+        if let Some(vc) = self.vc {
+            (vc, self.vcc - vc)
+        } else {
+            let vrc = (self.vcc - self.ve) / 2.0;
+            let vc = self.vcc - vrc;
+            (vc, vrc)
+        }
     }
 
     fn v_bias(&self) -> f64 {
@@ -93,40 +93,25 @@ impl Params {
     }
 
     fn check_boost(&self) -> Option<Boost> {
-        if self.boost {
-            let mut stdin = std::io::stdin();
-
-            loop {
-                print!("Match with 12ax7 valve (y/n): ");
-                std::io::stdout().flush().ok()?;
-
-                let mut buffer = [0u8; 32];
-                let n = stdin.read(&mut buffer).ok()?;
-                if let Ok(s) = str::from_utf8(&buffer[..n]).map(str::trim) {
-                    match s {
-                        "q" | "quit" => {
-                            println!("Aborted");
-                            return None;
-                        },
-                        "y" | "yes" => return ValveParams::get(self.cgk, self.cpg).ok().map(Boost::ValveBased),
-                        "n" | "no" => {
-                            print!("Set the cutoff frequency: ");
-                            std::io::stdout().flush().ok()?;
-                            let mut buffer = [0u8; 32];
-                            let n = stdin.read(&mut buffer).ok()?;
-                            if let Ok(Ok(hz)) = str::from_utf8(&buffer[..n])
-                                .map(str::trim)
-                                .map(<f64 as FromStr>::from_str)
-                            {
-                                return Some(Boost::PlainBoost(hz));
-                            }
-                        },
-                        _ => {},
+        match self.boost {
+            1 => {
+                let mut stdin = std::io::stdin();
+                loop {
+                    print!("Set the cutoff frequency: ");
+                    std::io::stdout().flush().ok()?;
+                    let mut buffer = [0u8; 32];
+                    let n = stdin.read(&mut buffer).ok()?;
+                    if let Ok(Ok(hz)) = str::from_utf8(&buffer[..n])
+                        .map(str::trim)
+                        .map(<f64 as FromStr>::from_str)
+                    {
+                        return Some(Boost::PlainBoost(hz));
                     }
                 }
-            }
-        } else {
-            None
+            },
+            2 => return ValveParams::get(crate::valve::Mode::Dz).ok().map(Boost::ValveBased),
+            3 => return ValveParams::get(crate::valve::Mode::Koren).ok().map(Boost::ValveBased),
+            _ => return None
         }
     }
 }
@@ -137,17 +122,16 @@ enum Boost {
 }
 
 impl Boost {
-    fn analyze(&self, rc: f64, re: f64, ree: f64) -> Result<crate::valve::ACNetwork, Error> {
+    fn analyze(&self, zo: f64, re: f64, ree: f64) -> Result<crate::valve::ACNetwork, Error> {
         match self {
-            Boost::ValveBased(valve) => valve.ac_analysis(rc, re, ree),
+            Boost::ValveBased(valve) => valve.ac_analysis(zo, re, ree),
             Boost::PlainBoost(hz) => {
                 let ze = rpar!(re, ree);
                 let c_bypass = rcf(ze, *hz);
                 Ok(crate::valve::ACNetwork {
                     r_bypass: 0.0,
                     c_bypass,
-                    cbe: None,
-                    cbc: None,
+                    gain: zo / ree,
                 })
             },
         }
@@ -197,9 +181,8 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
     let ic = ib * params.beta;
     let ibc = ib + ic; // ibc = ie
 
-    let vrc = params.vrc();
+    let (vc, vrc) = params.vc_vrc();
     let vb = params.vb();
-    let vc = params.vcc - vrc;
     let rc = vrc / ibc;
 
     let rf = (vc - vb) / ib;
@@ -252,9 +235,8 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     ib = ie / alpha;
     let ic = ib * params.beta;
 
-    let vrc = params.vrc();
+    let (vc, vrc) = params.vc_vrc();
     let vb = params.vb();
-    let vc = params.vcc - vrc;
 
     let mut rbg = 0.1 * params.beta * re;
     select("Max rbg", rbg, |new| {
@@ -321,22 +303,19 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     select("Suggested re", re, |new| Ok(re = new))?;
     ie = params.ve / re;
     ib = ie / alpha;
-    let ic = ib * params.beta;
 
-    let vrc = params.vrc();
+    let (vc, vrc) = params.vc_vrc();
     let vb = params.vb();
-    let vc = params.vcc - vrc;
 
-    let max_v_split = (vc / 2.0) - vb;
-
-    if max_v_split <= 0.0 {
-        return Err(Error::Other("Not enough room for split network, readjust your params".to_owned()))
+    let min_v_split = (vc - vb) / 2.0;
+    if min_v_split <= vb {
+        return Err(Error::Other(format!("Voltage at split node ({min_v_split:.2}) <= expected Vb ({vb:.2}). Readjust your params.")));
     }
 
-    let mut rb = max_v_split / ib;
+    let mut rb = min_v_split / ib;
     select("Max rb", rb, |new| {
         if new > rb {
-            print!("New rb exceeds maximum recommended value.\n");
+            print!("New rb exceeds the recommended value.\n");
             std::io::stdout().flush().unwrap();
             Err(SelectError)
         } else {
@@ -349,7 +328,7 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     let mut rfg = v_split / (10.0 * ib);
     select("Max rfg", rfg, |new| {
         if new > rfg {
-            print!("New rfg exceeds maximum recommended value.\n");
+            print!("New rfg exceeds the recommended value.\n");
             std::io::stdout().flush().unwrap();
             Err(SelectError)
         } else {
@@ -358,13 +337,14 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
         }
     })?;
 
+    let ic = ib * params.beta;
     let irfg = v_split / rfg;
     let irfc = irfg + ib;
     let rfc = (vc - v_split) / irfc;
     let irc = irfc + ic;
     let rc = vrc / irc;
-    let ree = VT / ie;
 
+    let ree = VT / ie;
     let zb = alpha * (re + ree);
     let zi = rpar!(rb, zb);
     let zo = rpar!(rfc, rc);
@@ -419,8 +399,7 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     let ic = ib * params.beta;
 
     let vb = params.vb();
-    let vrc = params.vrc();
-    let vc = params.vcc - vrc;
+    let (vc, vrc) = params.vc_vrc();
     let rc = vrc / ic;
 
     let mut r2 = 0.1 * params.beta * re;
@@ -570,19 +549,23 @@ pub(crate) fn get_params() -> Result<Params, Error> {
             return Err(Error::InvalidArgs("Both beta & hfe are defined at the same time, use only one of them.".to_owned()))
         }
 
+        let mut mode_locked = false;
+        let mut bias_locked = false;
+        let mut boost_locked = false;
         let mut i = 0;
+
         while i < len {
             match cmd[i].as_str() {
                 "-ic"              => { params.ic = parse(&cmd[i + 1])?; i += 1 },
                 "-beta" | "-hfe"   => { params.beta = parse(&cmd[i + 1])?; i += 1 },
-                // "-load"            => { params.load = Some(parse(&cmd[i + 1])?); i += 1 },
                 "-hpass"           => { params.hpass = parse(&cmd[i + 1])?; i += 1 },
                 "-lpass"           => { params.lpass = parse(&cmd[i + 1])?; i += 1 },
                 "-vcc"             => { params.vcc = parse(&cmd[i + 1])?; i += 1 },
                 "-ve"              => { params.ve = parse(&cmd[i + 1])?; i += 1 },
+                "-vc"              => { params.vc = Some(parse(&cmd[i + 1])?); i += 1 },
                 "-vbe"             => { params.vbe = parse(&cmd[i + 1])?; i += 1 },
                 "-vbias"           => { params.vbias = Some(parse(&cmd[i + 1])?); i += 1 },
-                other              => get_mode_and_bias(&mut params, other)?,
+                other              => get_mode_and_bias(&mut params, &mut mode_locked, &mut bias_locked, &mut boost_locked, other)?,
             }
             i += 1;
         }
@@ -591,18 +574,18 @@ pub(crate) fn get_params() -> Result<Params, Error> {
     Ok(params)
 }
 
-fn get_mode_and_bias(params: &mut Params, s: &str) -> Result<(), Error> {
+fn get_mode_and_bias(params: &mut Params, mode_locked: &mut bool, bias_locked: &mut bool, boost_locked: &mut bool, s: &str) -> Result<(), Error> {
     match s {
-        "-ce"            => params.mode = BjtMode::CommonEmitter,
-        "-cc"            => params.mode = BjtMode::CommonCollector,
-        "-vdiv"          => params.bias = BiasConfig::VoltageDivider,
-        "-cfb"           => params.bias = BiasConfig::CollectorFeedback,
-        "-cfdiv"         => params.bias = BiasConfig::CollectorFeedbackDivider,
-        "-split"         => params.bias = BiasConfig::CollectorFeedbackSplit,
-        "-emb"           => params.bias = BiasConfig::EmitterBias,
-        "-boost"         => params.boost = true,
-        "-cgk"           => params.cgk = true,
-        "-cpg"           => params.cpg = true,
+        "-ce"            => if !*mode_locked { params.mode = BjtMode::CommonEmitter; *mode_locked = true },
+        "-cc"            => if !*mode_locked { params.mode = BjtMode::CommonCollector; *mode_locked = true },
+        "-vdiv"          => if !*bias_locked { params.bias = BiasConfig::VoltageDivider; *bias_locked = true },
+        "-cfb"           => if !*bias_locked { params.bias = BiasConfig::CollectorFeedback; *bias_locked = true },
+        "-cfdiv"         => if !*bias_locked { params.bias = BiasConfig::CollectorFeedbackDivider; *bias_locked = true },
+        "-split"         => if !*bias_locked { params.bias = BiasConfig::CollectorFeedbackSplit; *bias_locked = true },
+        "-emb"           => if !*bias_locked { params.bias = BiasConfig::EmitterBias; *bias_locked = true },
+        "-boost"         => if !*boost_locked { params.boost = 1; *boost_locked = true },
+        "-dz"            => if !*boost_locked { params.boost = 2; *boost_locked = true },
+        "-koren"         => if !*boost_locked { params.boost = 3; *boost_locked = true },
         "-h" | "--help"  => return Err(Error::NeedsHelp),
         _                => return Err(Error::InvalidArgs(s.to_owned()))
     }
@@ -624,7 +607,7 @@ pub(crate) fn select(what: &str, suggest: f64, mut f: impl FnMut(f64) -> Result<
             println!("Aborted");
             return Err(Error::Aborted);
         }
-        if let Ok(Ok(new)) = s.map(<f64 as FromStr>::from_str) {
+        if let Ok(Ok(new)) = s.map(parse) {
             match f(new) {
                 Ok(_) => break,
                 Err(_err) => {}
