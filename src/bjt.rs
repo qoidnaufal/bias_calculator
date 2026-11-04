@@ -31,7 +31,7 @@ impl Default for Params {
             ic:       1e-3,
             beta:     1e2,
             hpass:    7.0,
-            lpass:    20e3,
+            lpass:    7.7e3,
             vcc:      24.0,
             vbe:      0.65,
             vc:       None,
@@ -51,14 +51,16 @@ pub(crate) fn analyze(params: &Params) -> Result<(), Error> {
             BiasConfig::CollectorFeedback           => collector_feedback(params)?,
             BiasConfig::CollectorFeedbackDivider    => collector_feedback_divider(params)?,
             BiasConfig::CollectorFeedbackSplit      => split_collector_feedback(params)?,
+            BiasConfig::Bootstrap                   => bootstrap_ce(params)?,
             BiasConfig::EmitterBias                 => return Err(Error::DiscouragedMode),
         },
         BjtMode::CommonCollector => match params.bias {
             BiasConfig::VoltageDivider              => voltage_divider_cc(params)?,
+            BiasConfig::Bootstrap                   => bootstrap_cc(params)?,
+            BiasConfig::EmitterBias                 => emitter_bias_cc(params)?,
             BiasConfig::CollectorFeedback
             | BiasConfig::CollectorFeedbackDivider
             | BiasConfig::CollectorFeedbackSplit    => return Err(Error::DiscouragedMode),
-            BiasConfig::EmitterBias                 => emitter_bias_cc(params)?,
         },
     }
 
@@ -148,25 +150,13 @@ enum BiasConfig {
     CollectorFeedback,
     CollectorFeedbackDivider,
     CollectorFeedbackSplit,
+    Bootstrap,
     EmitterBias,
 }
 
 fn print_mode(mode: &BjtMode, bias: &BiasConfig) {
     println!("\x1B[1;32m{}\x1B[0m - \x1B[1;32m{}\x1B[0m", mode, bias);
 }
-
-// /// ro = vaf / ic
-// fn zi_cf(beta: f64, rc: f64, rf: f64, re: f64, ree: f64, ro: f64) -> f64 {
-//     let b  = beta + 1.0;
-//     let zb = b * (re + ree);
-
-//     let n0 = rc*re*rf + b*ree*(rc*re + rc*rf + re*rf);
-//     let d0 = rf*(rc + re) + b*ree*(rc + re);
-//     let n1 = zb * (rc + rf);
-//     let d1 = rf + b*(rc + re + ree);
-
-//     (ro*n1 + n0) / (ro*d1 + d0)
-// }
 
 /// Only works in common emitter mode,
 /// Vcc - Ibc * Rc - Ib * Rf - Vbe - Ie * Re = 0
@@ -187,10 +177,9 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
 
     let rf = (vc - vb) / ib;
     let ree = VT / ie;
-    // let ro = params.vaf / ic;
 
-    let zb = alpha * (re + ree);
-    let zi = zb * (rc + rf) / (rf + zb + alpha * rc);
+    let rpi = alpha * (re + ree);
+    let zi = rpi * (rc + rf) / (rf + rpi + alpha * rc);
     let zo = rpar!(rf, rc);
 
     let input_cap = rcf(zi, params.hpass);
@@ -257,8 +246,8 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let rc = vrc / irc;
     let ree = VT / ie;
 
-    let zb = alpha * (re + ree);
-    let zi_feedback = zb * (rc + rf) / (rf + zb + alpha * rc);
+    let rpi = alpha * (re + ree);
+    let zi_feedback = rpi * (rc + rf) / (rf + rpi + alpha * rc);
     let zi = rpar!(zi_feedback, rbg);
     let zo = rpar!(rf, rc);
 
@@ -307,15 +296,15 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     let (vc, vrc) = params.vc_vrc();
     let vb = params.vb();
 
-    let min_v_split = (vc - vb) / 2.0;
-    if min_v_split <= vb {
-        return Err(Error::Other(format!("Voltage at split node ({min_v_split:.2}) <= expected Vb ({vb:.2}). Readjust your params.")));
+    let available_v_split = vc - vb;
+    if available_v_split <= vb {
+        println!("Voltage at split node ({available_v_split:.2}) is less than expected Vb ({vb:.2}).");
     }
 
-    let mut rb = min_v_split / ib;
+    let mut rb = available_v_split / ib;
     select("Max rb", rb, |new| {
-        if new > rb {
-            print!("New rb exceeds the recommended value.\n");
+        if new <= 0.0 || new > rb {
+            print!("New Rb must be 0 < Rb <= {rb:.2e}\n");
             std::io::stdout().flush().unwrap();
             Err(SelectError)
         } else {
@@ -325,36 +314,36 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     })?;
 
     let v_split = ib.mul_add(rb, vb);
-    let mut rfg = v_split / (10.0 * ib);
-    select("Max rfg", rfg, |new| {
-        if new > rfg {
-            print!("New rfg exceeds the recommended value.\n");
+    let mut rsg = v_split / (10.0 * ib);
+    select("Max rsg", rsg, |new| {
+        if new > rsg {
+            print!("New rsg exceeds the recommended value.\n");
             std::io::stdout().flush().unwrap();
             Err(SelectError)
         } else {
-            rfg = new;
+            rsg = new;
             Ok(())
         }
     })?;
 
     let ic = ib * params.beta;
-    let irfg = v_split / rfg;
-    let irfc = irfg + ib;
-    let rfc = (vc - v_split) / irfc;
-    let irc = irfc + ic;
+    let irsg = if rsg > 0.0 { v_split / rsg } else { 0.0 };
+    let irsc = irsg + ib;
+    let rsc = (vc - v_split) / irsc;
+    let irc = irsc + ic;
     let rc = vrc / irc;
 
     let ree = VT / ie;
-    let zb = alpha * (re + ree);
-    let zi = rpar!(rb, zb);
-    let zo = rpar!(rfc, rc);
+    let rpi = alpha * (re + ree);
+    let zi = rpar!(rb, rpi);
+    let zo = rpar!(rsc, rc);
 
     let input_cap = rcf(zi, params.hpass);
     let low_pass_cap = rcf(zo, params.lpass);
 
     let mut shunt_freq = 7.0;
     select("Default shunted freq", shunt_freq, |new| Ok(shunt_freq = new))?;
-    let z_shunt = rpar!(rfg, rfc, (rb + zb));
+    let z_shunt = rpar!(rsg, rsc, (rb + rpi));
     let shunt_cap = rcf(z_shunt, shunt_freq);
 
     let rc_bypass = params.check_boost().map(|boost| boost.analyze(zo, re, ree));
@@ -363,13 +352,13 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     print!("vc               : {vc:.2}\n");
     print!("ic               : {ic:.2e}\n");
     print!("irc              : {irc:.2e}\n");
-    print!("irfc             : {irfc:.2e}\n");
+    print!("irfc             : {irsc:.2e}\n");
     print!("vce              : {:.2}\n", vc - params.ve);
     print!("-----------------------------------\n");
     print!("rc               : {rc:.2e}\n");
     print!("re               : {re:.2e}\n");
-    print!("rfg              : {rfg:.2e}\n");
-    print!("rfc              : {rfc:.2e}\n");
+    print!("rfg              : {rsg:.2e}\n");
+    print!("rfc              : {rsc:.2e}\n");
     print!("rb               : {rb:.2e}\n");
     print!("zi               : {zi:.2e}\n");
     print!("zo               : {zo:.2e}\n");
@@ -390,22 +379,24 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
 }
 
 fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
+    let alpha = params.alpha();
     let mut ib = params.ib();
     let mut ie = params.ic + ib;
     let mut re = params.ve / ie;
     select("Suggested re", re, |new| Ok(re = new))?;
     ie = params.ve / re;
-    ib = ie / (params.beta + 1.0);
+    ib = ie / alpha;
     let ic = ib * params.beta;
 
     let vb = params.vb();
     let (vc, vrc) = params.vc_vrc();
     let rc = vrc / ic;
 
-    let mut r2 = 0.1 * params.beta * re;
-    select("Max r2", r2, |new| {
-        if new > r2 {
-            print!("New r2 exceeds maximum recommended value\n");
+    let mut r2 = 0.05 * params.beta * re;
+    let max_r2 = 2.0 * r2;
+    select("Suggested r2", r2, |new| {
+        if new <= 0.0 || new > max_r2 {
+            print!("New R2 must be 0 < R2 <= {max_r2:.2e}\n");
             std::io::stdout().flush().unwrap();
             Err(SelectError)
         } else {
@@ -420,9 +411,10 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     let r_bias = rpar!(r1, r2);
     let ree = VT / ie;
 
-    let zi = rpar!(params.beta * (re + ree), r_bias);
+    let rpi = alpha * (re + ree);
+    let zi = rpar!(rpi, r_bias);
     let input_cap = rcf(zi, params.hpass);
-    let low_pass_cap = rcf(rc, params.lpass);
+    let low_pass_cap = rcf(rpi, params.lpass);
     let rc_bypass = params.check_boost().map(|boost| boost.analyze(rc, re, ree));
 
     print_mode(&params.mode, &params.bias);
@@ -438,8 +430,101 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     print!("zi               : {zi:.2e}\n");
     print!("zo               : {rc:.2e}\n");
     print!("input cap        : {input_cap:.2e}\n");
-    print!("low pass cap     : {low_pass_cap:.2e}\n");
     print!("ree              : {ree:.2e}\n");
+    print!("rpi              : {rpi:.2e}\n");
+    print!("low pass cap     : {low_pass_cap:.2e}\n");
+
+    if let Some(bypass) = rc_bypass {
+        if let Ok(bypass) = bypass {
+            print!("{bypass:?}\n");
+        }
+    }
+
+    std::io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn bootstrap_ce(params: &Params) -> Result<(), Error> {
+    let alpha = params.alpha();
+    let mut ib = params.ib();
+    let mut ie = params.ic + ib;
+    let mut re = params.ve / ie;
+    select("Suggested re", re, |new| Ok(re = new))?;
+    ie = params.ve / re;
+    ib = ie / alpha;
+    let ic = ib * params.beta;
+
+    let vb = params.vb();
+    let v_bias = params.v_bias();
+
+    let max_rb = (v_bias - vb) / (2.0 * ib);
+    let mut rb = (0.05 * params.beta * re).min(max_rb);
+    select("Suggested rb", rb, |new| {
+        if new <= 0.0 || new > max_rb {
+            print!("Rb must 0 < Rb <= {max_rb}\n");
+            std::io::stdout().flush().unwrap();
+            Err(SelectError)
+        } else {
+            rb = new;
+            Ok(())
+        }
+    })?;
+    let vrb = rb * ib;
+    let vr2 = vb + vrb;
+
+    let mut r2 = vr2 / (20.0 * ib);
+    let max_r2 = 2.0 * r2;
+    select("Suggested r2", r2, |new| {
+        if new <= 0.0 || new > max_r2 {
+            print!("New R2 must be 0 < R2 <= {max_r2:.2e}\n");
+            std::io::stdout().flush().unwrap();
+            Err(SelectError)
+        } else {
+            r2 = new;
+            Ok(())
+        }
+    })?;
+
+    let ir2 = vr2 / r2;
+    let ir1 = ib + ir2;
+    let r1 = (v_bias - vr2) / ir1;
+    let r_bias = rpar!(r1, r2);
+    let ree = VT / ie;
+
+    let re_ac = rpar!(re, r_bias);
+    let rpi = alpha * (re_ac + ree);
+    let rb_eff = rb * (re_ac + ree) / ree;
+    let zi = rpar!(rpi, rb_eff);
+    let input_cap = rcf(zi, params.hpass);
+    let z_bootstrap = rpar!(r_bias, rb);
+    let bootstrap_cap = rcf(z_bootstrap, params.hpass);
+
+    let (vc, vrc) = params.vc_vrc();
+    let rc = vrc / ic;
+
+    let low_pass_cap = rcf(rpi, params.lpass);
+    let feedback_cap = rcf(rc, params.lpass);
+    let rc_bypass = params.check_boost().map(|boost| boost.analyze(rc, re_ac, ree));
+
+    print_mode(&params.mode, &params.bias);
+    print!("vc               : {vc:.2}\n");
+    print!("ic               : {ic:.2e}\n");
+    print!("ir1              : {ir1:.2e}\n");
+    print!("vce              : {:.2}\n", vc - params.ve);
+    print!("-----------------------------------\n");
+    print!("rc               : {rc:.2e}\n");
+    print!("re               : {re:.2e}\n");
+    print!("r1               : {r1:.2e}\n");
+    print!("r2               : {r2:.2e}\n");
+    print!("zi               : {zi:.2e}\n");
+    print!("zo               : {rc:.2e}\n");
+    print!("input cap        : {input_cap:.2e}\n");
+    print!("bootstrap cap    : {bootstrap_cap:.2e}\n");
+    print!("ree              : {ree:.2e}\n");
+    print!("rpi              : {rpi:.2e}\n");
+    print!("low pass cap     : {low_pass_cap:.2e}\n");
+    print!("feedback cap     : {feedback_cap:.2e}\n");
 
     if let Some(bypass) = rc_bypass {
         if let Ok(bypass) = bypass {
@@ -453,20 +538,22 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
 }
 
 fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
+    let alpha = params.alpha();
     let mut ib = params.ib();
     let mut ie = params.ic + ib;
     let mut re = params.ve / ie;
     select("Suggested re", re, |new| Ok(re = new))?;
     ie = params.ve / re;
-    ib = ie / (params.beta + 1.0);
+    ib = ie / alpha;
     let ic = ib * params.beta;
 
     let vb = params.vb();
 
-    let mut r2 = 0.1 * params.beta * re;
-    select("Max r2", r2, |new| {
-        if new > r2 {
-            print!("New r2 exceeds maximum recommended value\n");
+    let mut r2 = 0.05 * params.beta * re;
+    let max_r2 = 2.0 * r2;
+    select("Suggested r2", r2, |new| {
+        if new > max_r2 {
+            print!("New r2 is bigger than {max_r2}\n");
             std::io::stdout().flush().unwrap();
             Err(SelectError)
         } else {
@@ -480,8 +567,8 @@ fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
     let r_bias = rpar!(r1, r2);
     let ree = VT / ie;
 
-    let zb = (params.beta + 1.0) * (re + ree);
-    let zi = rpar!(zb, r_bias);
+    let rpi = alpha * (re + ree);
+    let zi = rpar!(rpi, r_bias);
     let zo = rpar!(re, ree);
     let input_cap = rcf(zi, params.hpass);
 
@@ -492,6 +579,7 @@ fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
     print!("re               : {re:.2e}\n");
     print!("r1               : {r1:.2e}\n");
     print!("r2               : {r2:.2e}\n");
+    print!("rpi              : {rpi:.2e}\n");
     print!("zi               : {zi:.2e}\n");
     print!("zo               : {zo:.2e}\n");
     print!("input cap        : {input_cap:.2e}\n");
@@ -501,12 +589,13 @@ fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
 }
 
 fn emitter_bias_cc(params: &Params) -> Result<(), Error> {
+    let alpha = params.alpha();
     let mut ib = params.ib();
     let mut ie = params.ic + ib;
     let mut re = params.ve / ie;
     select("Suggested re", re, |new| Ok(re = new))?;
     ie = params.ve / re;
-    ib = ie / (params.beta + 1.0);
+    ib = ie / alpha;
 
     let vb = params.vb();
 
@@ -514,9 +603,8 @@ fn emitter_bias_cc(params: &Params) -> Result<(), Error> {
     select("Suggested rb", rb, |new| Ok(rb = new))?;
     let ree = VT / ie;
 
-    // let zb = params.beta * ree + (params.beta + 1.0) * re;
-    let zb = (params.beta + 1.0) * (re + ree);
-    let zi = rpar!(zb, rb);
+    let rpi = alpha * (re + ree);
+    let zi = rpar!(rpi, rb);
     let zo = rpar!(re, ree);
     let input_cap = rcf(zi, params.hpass);
 
@@ -529,6 +617,78 @@ fn emitter_bias_cc(params: &Params) -> Result<(), Error> {
     print!("zi               : {zi:.2e}\n");
     print!("zo               : {zo:.2e}\n");
     print!("input cap        : {input_cap:.2e}\n");
+    std::io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn bootstrap_cc(params: &Params) -> Result<(), Error> {
+    let alpha = params.alpha();
+    let mut ib = params.ib();
+    let mut ie = params.ic + ib;
+    let mut re = params.ve / ie;
+    select("Suggested re", re, |new| Ok(re = new))?;
+    ie = params.ve / re;
+    ib = ie / alpha;
+    let ic = ib * params.beta;
+
+    let vb = params.vb();
+    let v_bias = params.v_bias();
+
+    let max_rb = (v_bias - vb) / (2.0 * ib);
+    let mut rb = (0.05 * params.beta * re).min(max_rb);
+    select("Suggested rb", rb, |new| {
+        if new <= 0.0 || new > max_rb {
+            print!("New rb is bigger than {max_rb}\n");
+            std::io::stdout().flush().unwrap();
+            Err(SelectError)
+        } else {
+            rb = new;
+            Ok(())
+        }
+    })?;
+    let vrb = rb * ib;
+    let vr2 = vb + vrb;
+
+    let mut r2 = vr2 / (20.0 * ib);
+    let max_r2 = 2.0 * r2;
+    select("Suggested r2", r2, |new| {
+        if new <= 0.0 || new > max_r2 {
+            print!("New R2 must be 0 < R2 <= {max_r2:.2e}\n");
+            std::io::stdout().flush().unwrap();
+            Err(SelectError)
+        } else {
+            r2 = new;
+            Ok(())
+        }
+    })?;
+
+    let ir2 = vr2 / r2;
+    let ir1 = ib + ir2;
+    let r1 = (v_bias - vr2) / ir1;
+    let r_bias = rpar!(r1, r2);
+    let ree = VT / ie;
+
+    let re_ac = rpar!(re, r_bias);
+    let rpi = alpha * (re_ac + ree);
+    let rb_eff = rb * (re_ac + ree) / ree;
+    let zi = rpar!(rpi, rb_eff);
+    let zo = rpar!(re, ree);
+    let input_cap = rcf(zi, params.hpass);
+    let z_bootstrap = rpar!(r_bias, rb);
+    let bootstrap_cap = rcf(z_bootstrap, params.hpass);
+
+    print_mode(&params.mode, &params.bias);
+    print!("ic               : {ic:.2e}\n");
+    print!("ir1              : {ir1:.2e}\n");
+    print!("-----------------------------------\n");
+    print!("re               : {re:.2e}\n");
+    print!("r1               : {r1:.2e}\n");
+    print!("r2               : {r2:.2e}\n");
+    print!("zi               : {zi:.2e}\n");
+    print!("zo               : {zo:.2e}\n");
+    print!("input cap        : {input_cap:.2e}\n");
+    print!("bootstrap cap    : {bootstrap_cap:.2e}\n");
     std::io::stdout().flush()?;
 
     Ok(())
@@ -583,6 +743,7 @@ fn get_mode_and_bias(params: &mut Params, mode_locked: &mut bool, bias_locked: &
         "-cfdiv"         => if !*bias_locked { params.bias = BiasConfig::CollectorFeedbackDivider; *bias_locked = true },
         "-split"         => if !*bias_locked { params.bias = BiasConfig::CollectorFeedbackSplit; *bias_locked = true },
         "-emb"           => if !*bias_locked { params.bias = BiasConfig::EmitterBias; *bias_locked = true },
+        "-bts"           => if !*bias_locked { params.bias = BiasConfig::Bootstrap; *bias_locked = true },
         "-boost"         => if !*boost_locked { params.boost = 1; *boost_locked = true },
         "-dz"            => if !*boost_locked { params.boost = 2; *boost_locked = true },
         "-koren"         => if !*boost_locked { params.boost = 3; *boost_locked = true },
@@ -635,6 +796,7 @@ impl core::fmt::Display for BiasConfig {
             BiasConfig::CollectorFeedback        => "Collector Feedback",
             BiasConfig::CollectorFeedbackDivider => "Collector Feedback Divider",
             BiasConfig::CollectorFeedbackSplit   => "Collector Feedback Split",
+            BiasConfig::Bootstrap                => "Bootstrap",
             BiasConfig::EmitterBias              => "Emitter Bias",
         };
         write!(f, "{s}")

@@ -180,7 +180,7 @@ impl ValveParams {
         let boosted_freq = rcf(rk_eq, self.ck);
         let ratio = gain_ratio(MU_P1, self.rp, rpp, self.rk);
 
-        println!("calculated \x1B[1;33mgain ratio\x1B[0m is: \x1B[1;32m{ratio:.2}\x1B[0m");
+        println!(" > \x1B[1;33mvp\x1B[0m : {vp:.2} | \x1B[1;33mgain ratio\x1B[0m : {ratio:.2} | \x1B[1;33mfreq\x1B[0m : {boosted_freq:.2}");
 
         (boosted_freq, ratio)
     }
@@ -214,7 +214,8 @@ impl ValveParams {
         let boosted_freq = rcf(rk_eq, self.ck);
         let ratio = gain_ratio(mu_p1, self.rp, rpp, self.rk);
 
-        println!("calculated \x1B[1;33mvk\x1B[0m is: \x1B[1;32m{vk:.2}\x1B[0m, and \x1B[1;33mgain ratio\x1B[0m is: \x1B[1;32m{ratio:.2}\x1B[0m");
+        let vp = self.vs - i * self.rp;
+        println!(" > \x1B[1;33mvp\x1B[0m : {vp:.2} | \x1B[1;33mvk\x1B[0m : {vk:.2} | \x1B[1;33mgain ratio\x1B[0m : {ratio:.2} | \x1B[1;33mfreq\x1B[0m : {boosted_freq:.2}");
 
         (boosted_freq, ratio)
     }

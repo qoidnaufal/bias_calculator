@@ -56,7 +56,6 @@ pub(crate) fn parse(s: &str) -> Result<f64, Error> {
 enum Error {
     NumParse(String),
     InvalidArgs(String),
-    Other(String),
     NeedsHelp,
     DiscouragedMode,
     Aborted,
@@ -68,7 +67,6 @@ impl core::fmt::Display for Error {
         match self {
             Error::NumParse(msg)           => write!(f, "Unable to parse int/float: {msg}"),
             Error::InvalidArgs(msg)        => write!(f, "Invalid args: {msg}"),
-            Error::Other(msg)              => write!(f, "Other: {msg}"),
             Error::NeedsHelp               => write!(f, "Needs help"),
             Error::DiscouragedMode         => write!(f, "This mode & bias is discouraged"),
             Error::Aborted                 => write!(f, "Aborted"),
@@ -113,6 +111,7 @@ Bias (default: vdiv)
     -cfdiv          : set the bias configuration to collector feedback resistor with a base shunt-resistor
     -split          : set the bias configuration to split collector feedback with shunt network in between 2 feedback resistors
     -emb            : set the bias configuration to emitter bias
+    -bts            : set the bias configuration to bootstrap
     -boost          : set to calculate emitter bypass capacitor
     -dz             : emulate 12ax7 cathode bypass using Dempwolf-Zolzer's model
     -koren          : emulate 12ax7 cathode bypass using Koren's model
@@ -125,11 +124,11 @@ fn main() -> std::io::Result<()> {
     if let Err(err) = bjt::get_params().as_ref().map(bjt::analyze) {
         match err {
             Error::NeedsHelp => print!("{HELP}\n"),
-            Error::NumParse(e) |
             Error::InvalidArgs(e) => {
                 print!("[ERROR] {e}\n");
                 print!("{HELP}\n");
             },
+            Error::NumParse(s) => print!("[ERROR] {s}\n"),
             other => print!("{other}\n"),
         }
         std::io::stdout().flush()?;
