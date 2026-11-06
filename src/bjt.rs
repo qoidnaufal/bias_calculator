@@ -1,8 +1,7 @@
-use std::io::{Read, Write};
-use core::str::FromStr;
+use std::io::Write;
 
 use crate::{Error, SelectError};
-use crate::{rpar, rcf, parse};
+use crate::{rpar, rcf, parse, read_buffer};
 use crate::valve::ValveParams;
 
 pub(crate) const BOLTZMANN:   f64 = 1.380649e-23;
@@ -30,8 +29,8 @@ impl Default for Params {
         Self {
             ic:       1e-3,
             beta:     1e2,
-            hpass:    7.0,
-            lpass:    7.7e3,
+            hpass:    3.38,
+            lpass:    8e3,
             vcc:      24.0,
             vbe:      0.65,
             vc:       None,
@@ -98,15 +97,15 @@ impl Params {
         match self.boost {
             1 => {
                 let mut stdin = std::io::stdin();
+
                 loop {
                     print!("Set the cutoff frequency: ");
                     std::io::stdout().flush().ok()?;
+
                     let mut buffer = [0u8; 32];
-                    let n = stdin.read(&mut buffer).ok()?;
-                    if let Ok(Ok(hz)) = str::from_utf8(&buffer[..n])
-                        .map(str::trim)
-                        .map(<f64 as FromStr>::from_str)
-                    {
+                    let s = read_buffer(&mut stdin, &mut buffer);
+
+                    if let Ok(Ok(hz)) = s.map(crate::parse) {
                         return Some(Boost::PlainBoost(hz));
                     }
                 }
@@ -129,11 +128,53 @@ impl Boost {
             Boost::ValveBased(valve) => valve.ac_analysis(zo, re, ree),
             Boost::PlainBoost(hz) => {
                 let ze = rpar!(re, ree);
-                let c_bypass = rcf(ze, *hz);
+                let mut stdin = std::io::stdin();
+                let mut r_bypass = 0.0;
+                let mut c_bypass = 0.0;
+                let mut gain = zo / (re + ree);
+
+                print!("Unbypassed gain: \x1B[1;33m{gain:.2}\x1B[0m, Set the bypass gain ratio: ");
+                std::io::stdout().flush()?;
+
+                let mut buffer = &mut [0u8; 32];
+                let s = read_buffer(&mut stdin, &mut buffer);
+
+                if let Ok(Ok(gain_ratio)) = s.map(crate::parse) {
+                    let a = zo / gain_ratio - ree;
+                    let suggested_r_bypass = crate::par_extract(a, re);
+
+                    'inner: loop {
+                        print!("Suggested r_bypass is \x1B[1;33m{suggested_r_bypass:.2e}\x1B[0m, select your value: ");
+                        std::io::stdout().flush()?;
+
+                        let mut buffer = &mut [0u8; 32];
+                        let s = read_buffer(&mut stdin, &mut buffer);
+
+                        if let Ok(Ok(new_r)) = s.map(crate::parse) {
+                            let new_c_bypass = rcf(new_r + ze, *hz);
+                            let ac_re = rpar!(new_r, re);
+                            let new_gain = zo / (ac_re + ree);
+
+                            print!("c_bypass will be: \x1B[1;33m{new_c_bypass:.2e}\x1B[0m, ac_gain will be: \x1B[1;33m{new_gain:.2}\x1B[0m, continue? ");
+                            std::io::stdout().flush()?;
+
+                            let mut buffer = &mut [0u8; 32];
+                            let s = read_buffer(&mut stdin, &mut buffer);
+
+                            if s.is_ok_and(|y| y == "yes" || y == "y") {
+                                r_bypass = new_r;
+                                c_bypass = new_c_bypass;
+                                gain = new_gain;
+                                break 'inner;
+                            }
+                        }
+                    }
+                }
+
                 Ok(crate::valve::ACNetwork {
-                    r_bypass: 0.0,
+                    r_bypass,
                     c_bypass,
-                    gain: zo / ree,
+                    gain,
                 })
             },
         }
@@ -228,16 +269,9 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let vb = params.vb();
 
     let mut rbg = 0.1 * params.beta * re;
-    select("Max rbg", rbg, |new| {
-        if new > rbg {
-            print!("New rbg exceeds maximum recommended value.\n");
-            std::io::stdout().flush().unwrap();
-            Err(SelectError)
-        } else {
-            rbg = new;
-            Ok(())
-        }
-    })?;
+    let max_rbg = vb / (ib * 10.0);
+
+    select_minmax("rbg", &mut rbg, max_rbg)?;
 
     let ir2 = vb / rbg;
     let irf = ib + ir2;
@@ -392,18 +426,10 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     let (vc, vrc) = params.vc_vrc();
     let rc = vrc / ic;
 
-    let mut r2 = 0.05 * params.beta * re;
-    let max_r2 = 2.0 * r2;
-    select("Suggested r2", r2, |new| {
-        if new <= 0.0 || new > max_r2 {
-            print!("New R2 must be 0 < R2 <= {max_r2:.2e}\n");
-            std::io::stdout().flush().unwrap();
-            Err(SelectError)
-        } else {
-            r2 = new;
-            Ok(())
-        }
-    })?;
+    let mut r2 = 0.1 * params.beta * re;
+    let max_r2 = vb / (ib * 10.0);
+
+    select_minmax("r2", &mut r2, max_r2)?;
 
     let ir2 = vb / r2;
     let ir1 = ib + ir2;
@@ -419,7 +445,9 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
 
     print_mode(&params.mode, &params.bias);
     print!("vc               : {vc:.2}\n");
+    print!("vb               : {vb:.2}\n");
     print!("ic               : {ic:.2e}\n");
+    print!("ib               : {ib:.2e}\n");
     print!("ir1              : {ir1:.2e}\n");
     print!("vce              : {:.2}\n", vc - params.ve);
     print!("-----------------------------------\n");
@@ -459,32 +487,17 @@ fn bootstrap_ce(params: &Params) -> Result<(), Error> {
     let v_bias = params.v_bias();
 
     let max_rb = (v_bias - vb) / (2.0 * ib);
-    let mut rb = (0.05 * params.beta * re).min(max_rb);
-    select("Suggested rb", rb, |new| {
-        if new <= 0.0 || new > max_rb {
-            print!("Rb must 0 < Rb <= {max_rb}\n");
-            std::io::stdout().flush().unwrap();
-            Err(SelectError)
-        } else {
-            rb = new;
-            Ok(())
-        }
-    })?;
+    let mut rb = (0.1 * params.beta * re).min(max_rb);
+
+    select_minmax("rb", &mut rb, max_rb)?;
+
     let vrb = rb * ib;
     let vr2 = vb + vrb;
 
     let mut r2 = vr2 / (20.0 * ib);
     let max_r2 = 2.0 * r2;
-    select("Suggested r2", r2, |new| {
-        if new <= 0.0 || new > max_r2 {
-            print!("New R2 must be 0 < R2 <= {max_r2:.2e}\n");
-            std::io::stdout().flush().unwrap();
-            Err(SelectError)
-        } else {
-            r2 = new;
-            Ok(())
-        }
-    })?;
+
+    select_minmax("r2", &mut r2, max_r2)?;
 
     let ir2 = vr2 / r2;
     let ir1 = ib + ir2;
@@ -497,8 +510,7 @@ fn bootstrap_ce(params: &Params) -> Result<(), Error> {
     let rb_eff = rb * (re_ac + ree) / ree;
     let zi = rpar!(rpi, rb_eff);
     let input_cap = rcf(zi, params.hpass);
-    let z_bootstrap = rpar!(r_bias, rb);
-    let bootstrap_cap = rcf(z_bootstrap, params.hpass);
+    let bootstrap_cap = rcf(r_bias, params.hpass);
 
     let (vc, vrc) = params.vc_vrc();
     let rc = vrc / ic;
@@ -509,7 +521,9 @@ fn bootstrap_ce(params: &Params) -> Result<(), Error> {
 
     print_mode(&params.mode, &params.bias);
     print!("vc               : {vc:.2}\n");
+    print!("vb               : {vb:.2}\n");
     print!("ic               : {ic:.2e}\n");
+    print!("ib               : {ib:.2e}\n");
     print!("ir1              : {ir1:.2e}\n");
     print!("vce              : {:.2}\n", vc - params.ve);
     print!("-----------------------------------\n");
@@ -517,6 +531,7 @@ fn bootstrap_ce(params: &Params) -> Result<(), Error> {
     print!("re               : {re:.2e}\n");
     print!("r1               : {r1:.2e}\n");
     print!("r2               : {r2:.2e}\n");
+    print!("rb               : {rb:.2e}\n");
     print!("zi               : {zi:.2e}\n");
     print!("zo               : {rc:.2e}\n");
     print!("input cap        : {input_cap:.2e}\n");
@@ -549,18 +564,11 @@ fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
 
     let vb = params.vb();
 
-    let mut r2 = 0.05 * params.beta * re;
-    let max_r2 = 2.0 * r2;
-    select("Suggested r2", r2, |new| {
-        if new > max_r2 {
-            print!("New r2 is bigger than {max_r2}\n");
-            std::io::stdout().flush().unwrap();
-            Err(SelectError)
-        } else {
-            r2 = new;
-            Ok(())
-        }
-    })?;
+    let mut r2 = 0.1 * params.beta * re;
+    let max_r2 = vb / (ib * 10.0);
+
+    select_minmax("r2", &mut r2, max_r2)?;
+
     let ir2 = vb / r2;
     let ir1 = ib + ir2;
     let r1 = (params.v_bias() - vb) / ir1;
@@ -573,7 +581,9 @@ fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
     let input_cap = rcf(zi, params.hpass);
 
     print_mode(&params.mode, &params.bias);
+    print!("vb               : {vb:.2e}\n");
     print!("ic               : {ic:.2e}\n");
+    print!("ib               : {ib:.2e}\n");
     print!("ir1              : {ir1:.2e}\n");
     print!("-----------------------------------\n");
     print!("re               : {re:.2e}\n");
@@ -637,31 +647,16 @@ fn bootstrap_cc(params: &Params) -> Result<(), Error> {
 
     let max_rb = (v_bias - vb) / (2.0 * ib);
     let mut rb = (0.05 * params.beta * re).min(max_rb);
-    select("Suggested rb", rb, |new| {
-        if new <= 0.0 || new > max_rb {
-            print!("New rb is bigger than {max_rb}\n");
-            std::io::stdout().flush().unwrap();
-            Err(SelectError)
-        } else {
-            rb = new;
-            Ok(())
-        }
-    })?;
+
+    select_minmax("rb", &mut rb, max_rb)?;
+
     let vrb = rb * ib;
     let vr2 = vb + vrb;
 
     let mut r2 = vr2 / (20.0 * ib);
     let max_r2 = 2.0 * r2;
-    select("Suggested r2", r2, |new| {
-        if new <= 0.0 || new > max_r2 {
-            print!("New R2 must be 0 < R2 <= {max_r2:.2e}\n");
-            std::io::stdout().flush().unwrap();
-            Err(SelectError)
-        } else {
-            r2 = new;
-            Ok(())
-        }
-    })?;
+
+    select_minmax("r2", &mut r2, max_r2)?;
 
     let ir2 = vr2 / r2;
     let ir1 = ib + ir2;
@@ -675,8 +670,7 @@ fn bootstrap_cc(params: &Params) -> Result<(), Error> {
     let zi = rpar!(rpi, rb_eff);
     let zo = rpar!(re, ree);
     let input_cap = rcf(zi, params.hpass);
-    let z_bootstrap = rpar!(r_bias, rb);
-    let bootstrap_cap = rcf(z_bootstrap, params.hpass);
+    let bootstrap_cap = rcf(r_bias, params.hpass);
 
     print_mode(&params.mode, &params.bias);
     print!("ic               : {ic:.2e}\n");
@@ -685,6 +679,7 @@ fn bootstrap_cc(params: &Params) -> Result<(), Error> {
     print!("re               : {re:.2e}\n");
     print!("r1               : {r1:.2e}\n");
     print!("r2               : {r2:.2e}\n");
+    print!("rb               : {rb:.2e}\n");
     print!("zi               : {zi:.2e}\n");
     print!("zo               : {zo:.2e}\n");
     print!("input cap        : {input_cap:.2e}\n");
@@ -762,16 +757,39 @@ pub(crate) fn select(what: &str, suggest: f64, mut f: impl FnMut(f64) -> Result<
         std::io::stdout().flush()?;
 
         let mut buffer = [0u8; 32];
-        let n = stdin.read(&mut buffer)?;
-        let s = str::from_utf8(&buffer[..n]).map(str::trim);
-        if s.is_ok_and(|q| q == "quit" || q == "q") {
+        let s = read_buffer(&mut stdin, &mut buffer);
+        if s.as_ref().is_ok_and(|q| *q == "quit" || *q == "q") {
             println!("Aborted");
             return Err(Error::Aborted);
         }
-        if let Ok(Ok(new)) = s.map(parse) {
+        if let Ok(Ok(new)) = s.map(crate::parse) {
             match f(new) {
                 Ok(_) => break,
                 Err(_err) => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn select_minmax(what: &str, target: &mut f64, max: f64) -> Result<(), Error> {
+    let mut stdin = std::io::stdin();
+
+    loop {
+        print!("Suggested {what} is: \x1B[1;33m{:.2e}\x1B[0m - \x1B[1;33m{max:.2e}\x1B[0m. Pick your value (type \x1B[1;32mquit\x1B[0m or \x1B[1;32mq\x1B[0m to abort): ", *target);
+        std::io::stdout().flush()?;
+
+        let mut buffer = [0u8; 32];
+        let s = read_buffer(&mut stdin, &mut buffer);
+        if s.as_ref().is_ok_and(|q| *q == "quit" || *q == "q") {
+            println!("Aborted");
+            return Err(Error::Aborted);
+        }
+        if let Ok(Ok(new)) = s.map(crate::parse) {
+            if new > 0.0 && new < max {
+                *target = new;
+                break
             }
         }
     }

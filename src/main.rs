@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Write, Read};
 
 mod valve;
 mod bjt;
@@ -52,6 +52,13 @@ pub(crate) fn parse(s: &str) -> Result<f64, Error> {
     parsed.map_err(|_| Error::NumParse(s.to_owned()))
 }
 
+pub(crate) fn read_buffer<'a>(stdin: &'a mut std::io::Stdin, buffer: &'a mut [u8; 32]) -> Result<&'a str, Error> {
+    let n = stdin.read(buffer)?;
+    str::from_utf8(&buffer[..n])
+        .map(str::trim)
+        .map_err(|err| Error::Io(err.to_string()))
+}
+
 #[derive(Debug)]
 enum Error {
     NumParse(String),
@@ -59,7 +66,7 @@ enum Error {
     NeedsHelp,
     DiscouragedMode,
     Aborted,
-    Io(std::io::Error),
+    Io(String),
 }
 
 impl core::fmt::Display for Error {
@@ -70,14 +77,14 @@ impl core::fmt::Display for Error {
             Error::NeedsHelp               => write!(f, "Needs help"),
             Error::DiscouragedMode         => write!(f, "This mode & bias is discouraged"),
             Error::Aborted                 => write!(f, "Aborted"),
-            Error::Io(io)                  => write!(f, "Io: {io:?}"),
+            Error::Io(io)                  => write!(f, "Io: {io}"),
         }
     }
 }
 
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
+        Self::Io(value.to_string())
     }
 }
 
