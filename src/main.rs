@@ -106,7 +106,7 @@ Commands
     -vbe            : set the vbe drop of the device (default: 0.65)
     -vbias          : set the bias voltage if any (default: vcc)
     -hpass          : set the desired hi-pass filter frequency cutoff at the input (default: 7Hz)
-    -lpass          : set the desired lo-pass filter for the collector-bypass or the collector-feedback capacitor (default: 20kHz)
+    -lpass          : set the desired lo-pass filter for the Miller capacitor (default: 15kHz)
 
 Mode (default: ce)
     -cc             : set the mode of the device to common collector
@@ -117,7 +117,7 @@ Bias (default: vdiv)
     -cfb            : set the bias configuration to collector feedback resistor
     -cfdiv          : set the bias configuration to collector feedback resistor with a base shunt-resistor
     -split          : set the bias configuration to split collector feedback with shunt network in between 2 feedback resistors
-    -emb            : set the bias configuration to emitter bias
+    -fixed          : set the bias configuration to fixed bias
     -bts            : set the bias configuration to bootstrap
     -boost          : set to calculate emitter bypass capacitor
     -dz             : emulate 12ax7 cathode bypass using Dempwolf-Zolzer's model
@@ -132,10 +132,10 @@ fn main() -> std::io::Result<()> {
         match err {
             Error::NeedsHelp => print!("{HELP}\n"),
             Error::InvalidArgs(e) => {
-                print!("[ERROR] {e}\n");
+                print!("[INVALID ARGS] {e}\n");
                 print!("{HELP}\n");
             },
-            Error::NumParse(s) => print!("[ERROR] {s}\n"),
+            Error::NumParse(s) => print!("[NUM PARSE ERROR] {s}\n"),
             other => print!("{other}\n"),
         }
         std::io::stdout().flush()?;
