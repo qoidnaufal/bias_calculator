@@ -134,7 +134,7 @@ impl Params {
         let vc_target = match self.vc {
             Some(vc) => vc,
             None => {
-                let mid = (self.vcc + self.ve) / 2.0;
+                let mid = self.vcc / 2.0 + 2.0 * self.ve;
                 if mid > v_min { mid } else { (self.vcc + v_min) / 2.0 }
             }
         };
@@ -164,7 +164,7 @@ impl Params {
         let vc = self.vcc - rc * irc;
 
         if vc - self.ve < 1.0 {
-            println!("Warning: Vce = {:.2} V is below 1 V, the transistor may saturate.", vc - self.ve);
+            println!("[WARNING]: Vce = {:.2} V is below 1 V, the transistor may saturate.", vc - self.ve);
         }
 
         Ok((vc, rc))
@@ -339,7 +339,7 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let (re, ie, ib, ic) = params.emitter_design()?;
 
     let vb = params.vb();
-    let mut rbg = 0.1 * params.beta * re;
+    let mut rbg = 0.05 * params.beta * re;
     let max_rbg = vb / (ib * 10.0);
 
     select_minmax("rbg", &mut rbg, max_rbg)?;
@@ -428,10 +428,10 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     let shunt_freq = select_positive("Default shunted freq", 7.0)?;
 
     // Small-signal admittance at the split node S (Vcc is AC ground):
-    //   S -> Rsg -> ground
-    //   S -> Rb -> base           (current vs / (rb + zb))
-    //   S -> Rsc -> collector -> Rc -> ground, where the collector is also driven by
-    //   the transistor current beta * vs / (rb + zb) flowing out of it.
+    // S -> Rsg -> ground
+    // S -> Rb  -> base           (current vs / (rb + zb))
+    // S -> Rsc -> collector -> Rc -> ground, where the collector is also driven by
+    // the transistor current beta * vs / (rb + zb) flowing out of it.
     // Solving the collector node gives the three terms below.
     let y_shunt = 1.0 / rsg
         + (1.0 + params.beta * rc / (rc + rsc)) / (rb + zb)
@@ -636,8 +636,10 @@ fn fixed_emitter_bias_cc(params: &Params) -> Result<(), Error> {
     let gamma = params.gamma();
     let (re, ie, ib, ic) = params.emitter_design()?;
 
-    let vb = params.vb();
-    let rb = select_positive("Suggested rb", (params.v_bias() - vb) / ib)?;
+    let mut vb = params.vb();
+    let v_bias = params.v_bias();
+    let rb = select_positive("Suggested rb", (v_bias - vb) / ib)?;
+    vb = v_bias - ib * rb;
 
     let ree = VT / ie;
     let zb = gamma * (re + ree);
@@ -648,6 +650,7 @@ fn fixed_emitter_bias_cc(params: &Params) -> Result<(), Error> {
     print_mode(&params.mode, &params.bias);
     print!("ib               : {ib:.2e}\n");
     print!("ic               : {ic:.2e}\n");
+    print!("vb               : {vb:.2e}\n");
     print!("-----------------------------------\n");
     print!("re               : {re:.2e}\n");
     print!("rb               : {rb:.2e}\n");
