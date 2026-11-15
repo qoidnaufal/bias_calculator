@@ -1,49 +1,36 @@
 use std::io::Write;
 
-use crate::{Error, SelectError};
-use crate::{rpar, rcf, parse, read_buffer};
-use crate::valve::ValveParams;
+use crate::rpar;
+use crate::util::{Error, rcf, self};
+use crate::parser::BjtParams;
 
 pub(crate) const BOLTZMANN:   f64 = 1.380649e-23;
 pub(crate) const CHARGE:      f64 = 1.602176634e-19;
 pub(crate) const TEMPERATURE: f64 = 300.15;
 pub(crate) const VT:          f64 = BOLTZMANN * TEMPERATURE / CHARGE;
 
-pub(crate) struct Params {
-    ic:       f64,
-    beta:     f64,
-    hpass:    f64,
-    lpass:    f64,
-    vcc:      f64,
-    vbe:      f64,
-    ve:       f64,
-    vc:       Option<f64>,
-    vbias:    Option<f64>,
-    boost:    u8,
-    mode:     BjtMode,
-    bias:     BiasConfig,
+pub(crate) struct ACNetwork {
+    pub(crate) r_bypass: Option<f64>,
+    pub(crate) c_bypass: Option<f64>,
+    /// bypassed gain
+    pub(crate) gain: f64,
 }
 
-impl Default for Params {
-    fn default() -> Self {
-        Self {
-            ic:       500e-6,
-            beta:     1e2,
-            hpass:    3.3,
-            lpass:    7.7e3,
-            vcc:      24.0,
-            vbe:      0.65,
-            vc:       None,
-            ve:       2.0,
-            vbias:    None,
-            boost:    0,
-            mode:     BjtMode::CommonEmitter,
-            bias:     BiasConfig::VoltageDivider,
+impl core::fmt::Debug for ACNetwork {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if let Some(r_bypass) = self.r_bypass {
+            write!(f, "r_bypass         : {r_bypass:.2e}\n")?;
         }
+        if let Some(c_bypass) = self.c_bypass {
+            write!(f, "c_bypass         : {c_bypass:.2e}\n")?;
+        }
+        write!(f, "ac gain          : {:.2}", self.gain)?;
+
+        Ok(())
     }
 }
 
-pub(crate) fn analyze(params: &Params) -> Result<(), Error> {
+pub(crate) fn analyze(params: &BjtParams) -> Result<(), Error> {
     match params.mode {
         BjtMode::CommonEmitter   => match params.bias {
             BiasConfig::VoltageDivider              => voltage_divider_ce(params)?,
@@ -66,218 +53,12 @@ pub(crate) fn analyze(params: &Params) -> Result<(), Error> {
     Ok(())
 }
 
-impl Params {
-    fn vb(&self) -> f64 {
-        self.ve + self.vbe
-    }
-
-    /// Sanity checks on the command line values, run once after parsing.
-    fn validate(&self) -> Result<(), Error> {
-        for (name, v) in [
-            ("-ic", self.ic),
-            ("-beta/-hfe", self.beta),
-            ("-hpass", self.hpass),
-            ("-lpass", self.lpass),
-            ("-vcc", self.vcc),
-            ("-ve", self.ve),
-            ("-vbe", self.vbe),
-        ] {
-            if !(v.is_finite() && v > 0.0) {
-                return Err(Error::InvalidArgs(format!("{name} must be a positive, finite number")));
-            }
-        }
-
-        let vb = self.vb();
-
-        if self.vcc <= vb {
-            return Err(Error::InvalidArgs(format!(
-                "-vcc ({:.2}) must be greater than Vb = Ve + Vbe ({vb:.2})", self.vcc
-            )));
-        }
-
-        if let Some(vbias) = self.vbias {
-            if !(vbias.is_finite() && vbias > vb) {
-                return Err(Error::InvalidArgs(format!(
-                    "-vbias ({vbias:.2}) must be greater than Vb = Ve + Vbe ({vb:.2})"
-                )));
-            }
-        }
-
-        if let Some(vc) = self.vc {
-            if !(vc.is_finite() && vc > self.ve && vc < self.vcc) {
-                return Err(Error::InvalidArgs(format!(
-                    "-vc ({vc:.2}) must be between Ve ({:.2}) and Vcc ({:.2})", self.ve, self.vcc
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Lets the user pick `re` (the suggestion comes from the requested Ic and Ve),
-    /// then returns the resulting (re, ie, ib, ic).
-    fn emitter_design(&self) -> Result<(f64, f64, f64, f64), Error> {
-        let ie0 = self.ic + self.ib();
-        let re = select_positive("Suggested re", self.ve / ie0)?;
-
-        let ie = self.ve / re;
-        let ib = ie / self.gamma();
-        let ic = ib * self.beta;
-
-        Ok((re, ie, ib, ic))
-    }
-
-    /// `irc` is the DC current through Rc.
-    /// `v_min` is the lowest acceptable collector voltage (strictly greater than it).
-    /// Returns (vc, rc).
-    fn vc_rc(&self, irc: f64, v_min: f64) -> Result<(f64, f64), Error> {
-        let vc_target = match self.vc {
-            Some(vc) => vc,
-            None => {
-                let mid = self.vcc / 2.0 + self.ve;
-                if mid > v_min && mid < self.vcc { mid } else { (self.vcc + v_min) / 2.0 }
-            }
-        };
-
-        if !(vc_target > v_min && vc_target < self.vcc) {
-            return Err(Error::InvalidArgs(format!(
-                "-vc must be between {v_min:.2} V and Vcc ({:.2} V) for this bias configuration", self.vcc
-            )));
-        }
-
-        let suggested_rc = (self.vcc - vc_target) / irc;
-        let mut rc = suggested_rc;
-
-        select("Suggested rc", suggested_rc, |new| {
-            if new.is_finite() && new > 0.0 && self.vcc - new * irc > v_min {
-                rc = new;
-                Ok(())
-            } else {
-                println!(
-                    "rc must be positive and keep Vc above {v_min:.2} V (rc < {:.2e}).",
-                    (self.vcc - v_min) / irc
-                );
-                Err(SelectError)
-            }
-        })?;
-
-        let vc = self.vcc - rc * irc;
-
-        if vc - self.ve < 1.0 {
-            println!("[WARNING]: Vce = {:.2} V is below 1 V, the transistor may saturate.", vc - self.ve);
-        }
-
-        Ok((vc, rc))
-    }
-
-    fn v_bias(&self) -> f64 {
-        self.vbias.unwrap_or(self.vcc)
-    }
-
-    fn ib(&self) -> f64 {
-        self.ic / self.beta
-    }
-
-    /// beta + 1
-    fn gamma(&self) -> f64 {
-        self.beta + 1.0
-    }
-
-    fn clipping_threshold(&self, vc: f64) {
-        let lo = vc - self.ve * 2.0;
-        let hi = self.vcc - vc;
-        println!("clipping threshold : lo = {lo:.2e} | hi = {hi:.2e}");
-    }
-
-    fn check_boost(&self) -> Result<Boost, Error> {
-        match self.boost {
-            1 => Ok(Boost::PlainBoost(prompt_positive("Set the \x1B[1;33mboosted frequency\x1B[0m: ")?)),
-            2 => ValveParams::get(crate::valve::Mode::Dz).map(Boost::ValveBased),
-            3 => ValveParams::get(crate::valve::Mode::Koren).map(Boost::ValveBased),
-            _ => Ok(Boost::FlatGain),
-        }
-    }
-}
-
-enum Boost {
-    ValveBased(ValveParams),
-    PlainBoost(f64),
-    FlatGain,
-}
-
-impl Boost {
-    fn analyze(&self, zo: f64, re: f64, ree: f64) -> Result<crate::valve::ACNetwork, Error> {
-        match self {
-            Boost::FlatGain => {
-                Ok(crate::valve::ACNetwork {
-                    r_bypass: None,
-                    c_bypass: None,
-                    gain: zo / (re + ree),
-                })
-            }
-            Boost::ValveBased(valve) => valve.ac_analysis(zo, re, ree),
-            Boost::PlainBoost(hz) => {
-                let ze = rpar!(re, ree);
-
-                // Gain with r_bypass -> infinity (no bypass) and r_bypass -> 0 (full bypass).
-                let min_gain = zo / (re + ree);
-                let max_gain = zo / ree;
-
-                let target = loop {
-                    let t = prompt_positive(&format!(
-                        "Available gain: \x1B[1;33m{min_gain:.2}\x1B[0m - \x1B[1;33m{max_gain:.2}\x1B[0m, set the desired gain: "
-                    ))?;
-
-                    let t = t.min(max_gain);
-                    if t > min_gain {
-                        break t;
-                    }
-                };
-
-                if (target - max_gain).abs() < 1e-2 {
-                    return Ok(crate::valve::ACNetwork {
-                        r_bypass: None,
-                        c_bypass: Some(rcf(ze, *hz)),
-                        gain: max_gain,
-                    });
-                }
-
-                let a = zo / target - ree;
-                let suggested_r_bypass = crate::par_extract(a, re);
-
-                let new_r = prompt_positive(&format!(
-                    "Suggested r_bypass is \x1B[1;33m{suggested_r_bypass:.2e}\x1B[0m, select your value: "
-                ))?;
-
-                let suggested_c_bypass = rcf(new_r + ze, *hz);
-                let ac_re = rpar!(new_r, re);
-
-                let new_gain = zo / (ac_re + ree);
-                println!("ac_gain is: \x1B[1;33m{new_gain:.2}\x1B[0m");
-
-                let new_c = prompt_positive(&format!(
-                    "Suggested c_bypass is \x1B[1;33m{suggested_c_bypass:.2e}\x1B[0m, select your value: "
-                ))?;
-
-                let new_freq = rcf(new_r + ze, new_c);
-                println!("boosted freq is: \x1B[1;33m{new_freq:.2}\x1B[0m");
-
-                Ok(crate::valve::ACNetwork {
-                    r_bypass: Some(new_r),
-                    c_bypass: Some(new_c),
-                    gain: new_gain,
-                })
-            },
-        }
-    }
-}
-
-enum BjtMode {
+pub(crate) enum BjtMode {
     CommonEmitter,
     CommonCollector,
 }
 
-enum BiasConfig {
+pub(crate) enum BiasConfig {
     VoltageDivider,
     CollectorFeedback,
     CollectorFeedbackDivider,
@@ -292,7 +73,7 @@ fn print_mode(mode: &BjtMode, bias: &BiasConfig) {
 
 /// Only works in common emitter mode,
 /// Vcc - Ibc * Rc - Ib * Rf - Vbe - Ie * Re = 0
-fn collector_feedback(params: &Params) -> Result<(), Error> {
+fn collector_feedback(params: &BjtParams) -> Result<(), Error> {
     let gamma = params.gamma();
     let (re, ie, ib, ic) = params.emitter_design()?;
     let ibc = ib + ic; // ibc = ie, this is the current through Rc
@@ -313,7 +94,7 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
     let low_pass_cap = rcf(zo, params.lpass);
 
     params.clipping_threshold(vc);
-    let rc_bypass = params.check_boost()?.analyze(zo, re, ree)?;
+    let rc_bypass = params.check_boost(zo, re, ree)?;
 
     print_mode(&params.mode, &params.bias);
     print!("vc               : {vc:.2}\n");
@@ -341,7 +122,7 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
 
 /// Only works in common emitter mode,
 /// Vcc - (Irf + Ic) * Rc - Irf * Rf - Vb = 0, with Irf = Ib + Vb / Rbg
-fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
+fn collector_feedback_divider(params: &BjtParams) -> Result<(), Error> {
     let gamma = params.gamma();
     let (re, ie, ib, ic) = params.emitter_design()?;
 
@@ -349,7 +130,7 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let mut rbg = 0.05 * params.beta * re;
     let max_rbg = vb / (ib * 10.0);
 
-    select_minmax("rbg", &mut rbg, max_rbg)?;
+    util::select_minmax("rbg", &mut rbg, max_rbg)?;
 
     let ir2 = vb / rbg;
     let irf = ib + ir2;
@@ -369,7 +150,7 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let input_cap = rcf(zi, params.hpass);
 
     params.clipping_threshold(vc);
-    let rc_bypass = params.check_boost()?.analyze(zo, re, ree)?;
+    let rc_bypass = params.check_boost(zo, re, ree)?;
     let miller_cap = rcf(zi, params.lpass * (1.0 + rc_bypass.gain));
 
     print_mode(&params.mode, &params.bias);
@@ -397,7 +178,7 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
 }
 
 /// Only works in common emitter mode,
-fn split_collector_feedback(params: &Params) -> Result<(), Error> {
+fn split_collector_feedback(params: &BjtParams) -> Result<(), Error> {
     let gamma = params.gamma();
     let (re, ie, ib, ic) = params.emitter_design()?;
 
@@ -412,11 +193,11 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     }
 
     let max_rb = available_v_split / ib;
-    let rb = select_upto("Max rb", max_rb, max_rb)?;
+    let rb = util::select_upto("Max rb", max_rb, max_rb)?;
 
     let v_split = vb + ib * rb;
     let max_rsg = v_split / (10.0 * ib);
-    let rsg = select_upto("Max rsg", max_rsg, max_rsg)?;
+    let rsg = util::select_upto("Max rsg", max_rsg, max_rsg)?;
 
     let irsg = v_split / rsg;
     let irsc = irsg + ib;
@@ -434,7 +215,7 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     let input_cap = rcf(zi, params.hpass);
     let low_pass_cap = rcf(zo, params.lpass);
 
-    let shunt_freq = select_positive("Default shunted freq", 7.0)?;
+    let shunt_freq = util::select_positive("Default shunted freq", 7.0)?;
 
     // Small-signal admittance at the split node S (Vcc is AC ground):
     // S -> Rsg -> ground
@@ -449,7 +230,7 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     let shunt_cap = rcf(z_shunt, shunt_freq);
 
     params.clipping_threshold(vc);
-    let rc_bypass = params.check_boost()?.analyze(zo, re, ree)?;
+    let rc_bypass = params.check_boost(zo, re, ree)?;
 
     print_mode(&params.mode, &params.bias);
     print!("vc               : {vc:.2}\n");
@@ -478,7 +259,7 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     Ok(())
 }
 
-fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
+fn voltage_divider_ce(params: &BjtParams) -> Result<(), Error> {
     let gamma = params.gamma();
     let (re, ie, ib, ic) = params.emitter_design()?;
 
@@ -488,7 +269,7 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     let mut r2 = vb / (ib * 20.0);
     let max_r2 = 2.0 * r2;
 
-    select_minmax("r2", &mut r2, max_r2)?;
+    util::select_minmax("r2", &mut r2, max_r2)?;
 
     let ir2 = vb / r2;
     let ir1 = ib + ir2;
@@ -502,7 +283,7 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     let input_cap = rcf(zi, params.hpass);
 
     params.clipping_threshold(vc);
-    let rc_bypass = params.check_boost()?.analyze(rc, re, ree)?;
+    let rc_bypass = params.check_boost(rc, re, ree)?;
     let miller_cap = rcf(zi, params.lpass * (1.0 + rc_bypass.gain));
 
     print_mode(&params.mode, &params.bias);
@@ -532,7 +313,7 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     Ok(())
 }
 
-fn bootstrap_ce(params: &Params) -> Result<(), Error> {
+fn bootstrap_ce(params: &BjtParams) -> Result<(), Error> {
     let gamma = params.gamma();
     let (re, ie, ib, ic) = params.emitter_design()?;
 
@@ -542,7 +323,7 @@ fn bootstrap_ce(params: &Params) -> Result<(), Error> {
     let max_rb = (v_bias - vb) / (2.0 * ib);
     let mut rb = (0.1 * params.beta * re).min(max_rb);
 
-    select_minmax("rb", &mut rb, max_rb)?;
+    util::select_minmax("rb", &mut rb, max_rb)?;
 
     let vrb = rb * ib;
     let vr2 = vb + vrb;
@@ -550,7 +331,7 @@ fn bootstrap_ce(params: &Params) -> Result<(), Error> {
     let mut r2 = vr2 / (20.0 * ib);
     let max_r2 = 2.0 * r2;
 
-    select_minmax("r2", &mut r2, max_r2)?;
+    util::select_minmax("r2", &mut r2, max_r2)?;
 
     let ir2 = vr2 / r2;
     let ir1 = ib + ir2;
@@ -569,7 +350,7 @@ fn bootstrap_ce(params: &Params) -> Result<(), Error> {
     let (vc, rc) = params.vc_rc(ic, params.ve)?;
 
     params.clipping_threshold(vc);
-    let rc_bypass = params.check_boost()?.analyze(rc, re_ac, ree)?;
+    let rc_bypass = params.check_boost(rc, re_ac, ree)?;
     let miller_cap = rcf(zi, params.lpass * (1.0 + rc_bypass.gain));
 
     print_mode(&params.mode, &params.bias);
@@ -601,7 +382,7 @@ fn bootstrap_ce(params: &Params) -> Result<(), Error> {
     Ok(())
 }
 
-fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
+fn voltage_divider_cc(params: &BjtParams) -> Result<(), Error> {
     let gamma = params.gamma();
     let (re, ie, ib, ic) = params.emitter_design()?;
 
@@ -610,7 +391,7 @@ fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
     let mut r2 = vb / (ib * 20.0);
     let max_r2 = 2.0 * r2;
 
-    select_minmax("r2", &mut r2, max_r2)?;
+    util::select_minmax("r2", &mut r2, max_r2)?;
 
     let ir2 = vb / r2;
     let ir1 = ib + ir2;
@@ -644,13 +425,13 @@ fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
     Ok(())
 }
 
-fn fixed_emitter_bias_cc(params: &Params) -> Result<(), Error> {
+fn fixed_emitter_bias_cc(params: &BjtParams) -> Result<(), Error> {
     let gamma = params.gamma();
     let (re, _, ib0, ic) = params.emitter_design()?;
 
     let vb0 = params.vb();
     let v_bias = params.v_bias();
-    let rb = select_positive("Suggested rb", (v_bias - vb0) / ib0)?;
+    let rb = util::select_positive("Suggested rb", (v_bias - vb0) / ib0)?;
     let ib = (v_bias - params.vbe) / (rb + gamma * re);
     let ie = gamma * ib;
     let vb = ie * re + params.vbe;
@@ -678,7 +459,7 @@ fn fixed_emitter_bias_cc(params: &Params) -> Result<(), Error> {
     Ok(())
 }
 
-fn bootstrap_cc(params: &Params) -> Result<(), Error> {
+fn bootstrap_cc(params: &BjtParams) -> Result<(), Error> {
     let gamma = params.gamma();
     let (re, ie, ib, ic) = params.emitter_design()?;
 
@@ -688,14 +469,14 @@ fn bootstrap_cc(params: &Params) -> Result<(), Error> {
     let max_rb = (v_bias - vb) / (2.0 * ib);
     let mut rb = (0.05 * params.beta * re).min(max_rb);
 
-    select_minmax("rb", &mut rb, max_rb)?;
+    util::select_minmax("rb", &mut rb, max_rb)?;
 
     let vrb = rb * ib;
     let vr2 = vb + vrb;
     let mut r2 = vr2 / (20.0 * ib);
     let max_r2 = 2.0 * r2;
 
-    select_minmax("r2", &mut r2, max_r2)?;
+    util::select_minmax("r2", &mut r2, max_r2)?;
 
     let ir2 = vr2 / r2;
     let ir1 = ib + ir2;
@@ -730,203 +511,6 @@ fn bootstrap_cc(params: &Params) -> Result<(), Error> {
     print!("zb               : {zb:.2e}\n");
 
     std::io::stdout().flush()?;
-
-    Ok(())
-}
-
-pub(crate) fn get_params() -> Result<Params, Error> {
-    let args = std::env::args().collect::<Vec<_>>();
-    if args.len() <= 1 { return Err(Error::NeedsHelp) }
-
-    let mut params = Params::default();
-
-    if let Some(cmd) = args.get(1..) {
-        let len = cmd.len();
-
-        let beta = String::from("-beta");
-        let hfe = String::from("-hfe");
-        if cmd.contains(&beta) && cmd.contains(&hfe) {
-            return Err(Error::InvalidArgs("Both beta & hfe are defined at the same time, use only one of them.".to_owned()))
-        }
-
-        let mut mode_locked = false;
-        let mut bias_locked = false;
-        let mut boost_locked = false;
-        let mut i = 0;
-
-        while i < len {
-            // Only the flags that take a value consume the next argument.
-            match cmd[i].as_str() {
-                "-ic"              => { params.ic = flag_value(cmd, i)?; i += 1 },
-                "-beta" | "-hfe"   => { params.beta = flag_value(cmd, i)?; i += 1 },
-                "-hpass"           => { params.hpass = flag_value(cmd, i)?; i += 1 },
-                "-lpass"           => { params.lpass = flag_value(cmd, i)?; i += 1 },
-                "-vcc"             => { params.vcc = flag_value(cmd, i)?; i += 1 },
-                "-ve"              => { params.ve = flag_value(cmd, i)?; i += 1 },
-                "-vc"              => { params.vc = Some(flag_value(cmd, i)?); i += 1 },
-                "-vbe"             => { params.vbe = flag_value(cmd, i)?; i += 1 },
-                "-vbias"           => { params.vbias = Some(flag_value(cmd, i)?); i += 1 },
-                other              => get_mode_and_bias(&mut params, &mut mode_locked, &mut bias_locked, &mut boost_locked, other)?,
-            }
-            i += 1;
-        }
-    }
-
-    params.validate()?;
-
-    if matches!(params.mode, BjtMode::CommonCollector) {
-        if params.vc.is_some() {
-            eprintln!("Warning: -vc has no effect in common collector mode.");
-        }
-        if params.boost != 0 {
-            eprintln!("Warning: boost options have no effect in common collector mode.");
-        }
-    }
-
-    Ok(params)
-}
-
-fn flag_value(cmd: &[String], i: usize) -> Result<f64, Error> {
-    let raw = cmd
-        .get(i + 1)
-        .ok_or_else(|| Error::InvalidArgs(format!("{} requires a value", cmd[i])))?;
-
-    Ok(parse(raw)?)
-}
-
-fn lock_option(locked: &mut bool, group: &str, flag: &str) -> Result<(), Error> {
-    if *locked {
-        return Err(Error::InvalidArgs(format!("{flag}: only one {group} option may be given")));
-    }
-    *locked = true;
-    Ok(())
-}
-
-fn get_mode_and_bias(params: &mut Params, mode_locked: &mut bool, bias_locked: &mut bool, boost_locked: &mut bool, s: &str) -> Result<(), Error> {
-    match s {
-        "-ce"            => { lock_option(mode_locked, "mode", s)?;  params.mode = BjtMode::CommonEmitter },
-        "-cc"            => { lock_option(mode_locked, "mode", s)?;  params.mode = BjtMode::CommonCollector },
-        "-vdiv"          => { lock_option(bias_locked, "bias", s)?;  params.bias = BiasConfig::VoltageDivider },
-        "-cfb"           => { lock_option(bias_locked, "bias", s)?;  params.bias = BiasConfig::CollectorFeedback },
-        "-cfdiv"         => { lock_option(bias_locked, "bias", s)?;  params.bias = BiasConfig::CollectorFeedbackDivider },
-        "-split"         => { lock_option(bias_locked, "bias", s)?;  params.bias = BiasConfig::CollectorFeedbackSplit },
-        "-fixed"         => { lock_option(bias_locked, "bias", s)?;  params.bias = BiasConfig::FixedBias },
-        "-bts"           => { lock_option(bias_locked, "bias", s)?;  params.bias = BiasConfig::Bootstrap },
-        "-boost"         => { lock_option(boost_locked, "boost", s)?; params.boost = 1 },
-        "-dz"            => { lock_option(boost_locked, "boost", s)?; params.boost = 2 },
-        "-koren"         => { lock_option(boost_locked, "boost", s)?; params.boost = 3 },
-        "-h" | "--help"  => return Err(Error::NeedsHelp),
-        _                => return Err(Error::InvalidArgs(s.to_owned()))
-    }
-
-    Ok(())
-}
-
-/// Asks for a strictly positive, finite number. `q` / `quit` aborts.
-fn prompt_positive(msg: &str) -> Result<f64, Error> {
-    let mut stdin = std::io::stdin();
-
-    loop {
-        print!("{msg}");
-        std::io::stdout().flush()?;
-
-        let mut buffer = [0u8; 32];
-        let s = read_buffer(&mut stdin, &mut buffer);
-        if s.as_ref().is_ok_and(|q| *q == "quit" || *q == "q") {
-            println!("Aborted");
-            return Err(Error::Aborted);
-        }
-        if let Ok(Ok(v)) = s.map(crate::parse) {
-            if v.is_finite() && v > 0.0 {
-                return Ok(v);
-            }
-        }
-    }
-}
-
-pub(crate) fn select(what: &str, suggest: f64, mut f: impl FnMut(f64) -> Result<(), SelectError>) -> Result<(), Error> {
-    let mut stdin = std::io::stdin();
-
-    loop {
-        print!("{what} is: \x1B[1;33m{suggest:.2e}\x1B[0m. Pick your value (type \x1B[1;32mquit\x1B[0m or \x1B[1;32mq\x1B[0m to abort): ");
-        std::io::stdout().flush()?;
-
-        let mut buffer = [0u8; 32];
-        let s = read_buffer(&mut stdin, &mut buffer);
-        if s.as_ref().is_ok_and(|q| *q == "quit" || *q == "q") {
-            println!("Aborted");
-            return Err(Error::Aborted);
-        }
-        if let Ok(Ok(new)) = s.map(crate::parse) {
-            match f(new) {
-                Ok(_) => break,
-                Err(_err) => {}
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Like `select`, but only accepts a positive, finite value.
-pub(crate) fn select_positive(what: &str, suggest: f64) -> Result<f64, Error> {
-    let mut value = suggest;
-
-    select(what, suggest, |new| {
-        if new.is_finite() && new > 0.0 {
-            value = new;
-            Ok(())
-        } else {
-            println!("The value must be a positive number.");
-            Err(SelectError)
-        }
-    })?;
-
-    Ok(value)
-}
-
-/// Like `select`, but only accepts 0 < value <= max.
-pub(crate) fn select_upto(what: &str, suggest: f64, max: f64) -> Result<f64, Error> {
-    let mut value = suggest;
-
-    select(what, suggest, |new| {
-        if new.is_finite() && new > 0.0 && new <= max {
-            value = new;
-            Ok(())
-        } else {
-            println!("The value must satisfy 0 < value <= {max:.2e}.");
-            Err(SelectError)
-        }
-    })?;
-
-    Ok(value)
-}
-
-pub(crate) fn select_minmax(what: &str, target: &mut f64, max: f64) -> Result<(), Error> {
-    if !(max.is_finite() && max > 0.0) {
-        return Err(Error::InvalidArgs(format!("No valid range for {what} with the given parameters")));
-    }
-
-    let mut stdin = std::io::stdin();
-
-    loop {
-        print!("Suggested {what} is: \x1B[1;33m{:.2e}\x1B[0m - \x1B[1;33m{max:.2e}\x1B[0m. Pick your value (type \x1B[1;32mquit\x1B[0m or \x1B[1;32mq\x1B[0m to abort): ", *target);
-        std::io::stdout().flush()?;
-
-        let mut buffer = [0u8; 32];
-        let s = read_buffer(&mut stdin, &mut buffer);
-        if s.as_ref().is_ok_and(|q| *q == "quit" || *q == "q") {
-            println!("Aborted");
-            return Err(Error::Aborted);
-        }
-        if let Ok(Ok(new)) = s.map(crate::parse) {
-            if new.is_finite() && new > 0.0 && new <= max {
-                *target = new;
-                break
-            }
-            println!("The value must satisfy 0 < {what} <= {max:.2e}.");
-        }
-    }
 
     Ok(())
 }
