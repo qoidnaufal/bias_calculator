@@ -98,15 +98,15 @@ Usage:
 
 Commands
     -h, --help      : print help
-    -ic             : set the desired collector current (default: 1mA)
+    -ic             : set the desired collector current (default: 500uA)
     -beta, -hfe     : set the current gain (Hfe) (default: 100)
     -vcc            : set the supply voltage (default: 24)
     -ve             : set the desired emitter voltage (default: 2)
     -vc             : set the desired collector voltage (default: None)
     -vbe            : set the vbe drop of the device (default: 0.65)
     -vbias          : set the bias voltage if any (default: vcc)
-    -hpass          : set the desired hi-pass filter frequency cutoff at the input (default: 7Hz)
-    -lpass          : set the desired lo-pass filter for the Miller capacitor (default: 15kHz)
+    -hpass          : set the desired hi-pass filter frequency cutoff at the input (default: 3.3Hz)
+    -lpass          : set the desired lo-pass filter for the Miller capacitor (default: 7.7kHz)
 
 Mode (default: ce)
     -cc             : set the mode of the device to common collector

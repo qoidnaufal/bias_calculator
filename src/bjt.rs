@@ -27,10 +27,10 @@ pub(crate) struct Params {
 impl Default for Params {
     fn default() -> Self {
         Self {
-            ic:       1e-3,
+            ic:       500e-6,
             beta:     1e2,
-            hpass:    7.0,
-            lpass:    15e3,
+            hpass:    3.3,
+            lpass:    7.7e3,
             vcc:      24.0,
             vbe:      0.65,
             vc:       None,
@@ -134,8 +134,8 @@ impl Params {
         let vc_target = match self.vc {
             Some(vc) => vc,
             None => {
-                let mid = self.vcc / 2.0 + 2.0 * self.ve;
-                if mid > v_min { mid } else { (self.vcc + v_min) / 2.0 }
+                let mid = self.vcc / 2.0 + self.ve;
+                if mid > v_min && mid < self.vcc { mid } else { (self.vcc + v_min) / 2.0 }
             }
         };
 
@@ -183,6 +183,12 @@ impl Params {
         self.beta + 1.0
     }
 
+    fn clipping_threshold(&self, vc: f64) {
+        let lo = vc - self.ve * 2.0;
+        let hi = self.vcc - vc;
+        println!("clipping threshold : lo = {lo:.2e} | hi = {hi:.2e}");
+    }
+
     fn check_boost(&self) -> Result<Boost, Error> {
         match self.boost {
             1 => Ok(Boost::PlainBoost(prompt_positive("Set the \x1B[1;33mboosted frequency\x1B[0m: ")?)),
@@ -204,8 +210,8 @@ impl Boost {
         match self {
             Boost::FlatGain => {
                 Ok(crate::valve::ACNetwork {
-                    r_bypass: 0.0,
-                    c_bypass: 0.0,
+                    r_bypass: None,
+                    c_bypass: None,
                     gain: zo / (re + ree),
                 })
             }
@@ -219,49 +225,48 @@ impl Boost {
 
                 let target = loop {
                     let t = prompt_positive(&format!(
-                        "Unbypassed gain: \x1B[1;33m{min_gain:.2}\x1B[0m, set the desired bypass gain (between \x1B[1;33m{min_gain:.2}\x1B[0m and \x1B[1;33m{max_gain:.2}\x1B[0m): "
+                        "Available gain: \x1B[1;33m{min_gain:.2}\x1B[0m - \x1B[1;33m{max_gain:.2}\x1B[0m, set the desired gain: "
                     ))?;
 
-                    if t > min_gain && t < max_gain {
+                    let t = t.min(max_gain);
+                    if t > min_gain {
                         break t;
                     }
-
-                    println!("The desired gain must be strictly between {min_gain:.2} and {max_gain:.2}.");
                 };
 
-                // target = zo / ((re || r_bypass) + ree)  =>  re || r_bypass = zo / target - ree
+                if (target - max_gain).abs() < 1e-2 {
+                    return Ok(crate::valve::ACNetwork {
+                        r_bypass: None,
+                        c_bypass: Some(rcf(ze, *hz)),
+                        gain: max_gain,
+                    });
+                }
+
                 let a = zo / target - ree;
                 let suggested_r_bypass = crate::par_extract(a, re);
-                let mut stdin = std::io::stdin();
 
-                loop {
-                    let new_r = prompt_positive(&format!(
-                        "Suggested r_bypass is \x1B[1;33m{suggested_r_bypass:.2e}\x1B[0m, select your value: "
-                    ))?;
+                let new_r = prompt_positive(&format!(
+                    "Suggested r_bypass is \x1B[1;33m{suggested_r_bypass:.2e}\x1B[0m, select your value: "
+                ))?;
 
-                    let new_c_bypass = rcf(new_r + ze, *hz);
-                    let ac_re = rpar!(new_r, re);
-                    let new_gain = zo / (ac_re + ree);
+                let suggested_c_bypass = rcf(new_r + ze, *hz);
+                let ac_re = rpar!(new_r, re);
 
-                    print!("c_bypass will be: \x1B[1;33m{new_c_bypass:.2e}\x1B[0m, ac_gain will be: \x1B[1;33m{new_gain:.2}\x1B[0m, continue? ");
-                    std::io::stdout().flush()?;
+                let new_gain = zo / (ac_re + ree);
+                println!("ac_gain is: \x1B[1;33m{new_gain:.2}\x1B[0m");
 
-                    let mut buffer = [0u8; 32];
-                    let answer = read_buffer(&mut stdin, &mut buffer);
+                let new_c = prompt_positive(&format!(
+                    "Suggested c_bypass is \x1B[1;33m{suggested_c_bypass:.2e}\x1B[0m, select your value: "
+                ))?;
 
-                    if answer.as_ref().is_ok_and(|q| *q == "quit" || *q == "q") {
-                        println!("Aborted");
-                        return Err(Error::Aborted);
-                    }
+                let new_freq = rcf(new_r + ze, new_c);
+                println!("boosted freq is: \x1B[1;33m{new_freq:.2}\x1B[0m");
 
-                    if answer.is_ok_and(|y| y == "yes" || y == "y") {
-                        return Ok(crate::valve::ACNetwork {
-                            r_bypass: new_r,
-                            c_bypass: new_c_bypass,
-                            gain: new_gain,
-                        });
-                    }
-                }
+                Ok(crate::valve::ACNetwork {
+                    r_bypass: Some(new_r),
+                    c_bypass: Some(new_c),
+                    gain: new_gain,
+                })
             },
         }
     }
@@ -306,6 +311,8 @@ fn collector_feedback(params: &Params) -> Result<(), Error> {
 
     let input_cap = rcf(zi, params.hpass);
     let low_pass_cap = rcf(zo, params.lpass);
+
+    params.clipping_threshold(vc);
     let rc_bypass = params.check_boost()?.analyze(zo, re, ree)?;
 
     print_mode(&params.mode, &params.bias);
@@ -360,6 +367,8 @@ fn collector_feedback_divider(params: &Params) -> Result<(), Error> {
     let zo = rpar!(rf, rc);
 
     let input_cap = rcf(zi, params.hpass);
+
+    params.clipping_threshold(vc);
     let rc_bypass = params.check_boost()?.analyze(zo, re, ree)?;
     let miller_cap = rcf(zi, params.lpass * (1.0 + rc_bypass.gain));
 
@@ -439,6 +448,7 @@ fn split_collector_feedback(params: &Params) -> Result<(), Error> {
     let z_shunt = 1.0 / y_shunt;
     let shunt_cap = rcf(z_shunt, shunt_freq);
 
+    params.clipping_threshold(vc);
     let rc_bypass = params.check_boost()?.analyze(zo, re, ree)?;
 
     print_mode(&params.mode, &params.bias);
@@ -491,6 +501,7 @@ fn voltage_divider_ce(params: &Params) -> Result<(), Error> {
     let zi = rpar!(zb, r_bias);
     let input_cap = rcf(zi, params.hpass);
 
+    params.clipping_threshold(vc);
     let rc_bypass = params.check_boost()?.analyze(rc, re, ree)?;
     let miller_cap = rcf(zi, params.lpass * (1.0 + rc_bypass.gain));
 
@@ -557,6 +568,7 @@ fn bootstrap_ce(params: &Params) -> Result<(), Error> {
 
     let (vc, rc) = params.vc_rc(ic, params.ve)?;
 
+    params.clipping_threshold(vc);
     let rc_bypass = params.check_boost()?.analyze(rc, re_ac, ree)?;
     let miller_cap = rcf(zi, params.lpass * (1.0 + rc_bypass.gain));
 
@@ -634,12 +646,15 @@ fn voltage_divider_cc(params: &Params) -> Result<(), Error> {
 
 fn fixed_emitter_bias_cc(params: &Params) -> Result<(), Error> {
     let gamma = params.gamma();
-    let (re, ie, ib, ic) = params.emitter_design()?;
+    let (re, _, ib0, ic) = params.emitter_design()?;
 
-    let mut vb = params.vb();
+    let vb0 = params.vb();
     let v_bias = params.v_bias();
-    let rb = select_positive("Suggested rb", (v_bias - vb) / ib)?;
-    vb = v_bias - ib * rb;
+    let rb = select_positive("Suggested rb", (v_bias - vb0) / ib0)?;
+    let ib = (v_bias - params.vbe) / (rb + gamma * re);
+    let ie = gamma * ib;
+    let vb = ie * re + params.vbe;
+    // vb = v_bias - ib * rb;
 
     let ree = VT / ie;
     let zb = gamma * (re + ree);
